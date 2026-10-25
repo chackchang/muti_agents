@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>测试文章标题</title></head>
+<body>
+<main>
+<article>
+<h1>测试文章标题：动态网页正文提取</h1>
+<p>这是第一个段落，用于验证正文提取是否完整，包含开头的关键标记 SENTENCE_ONE。</p>
+<p>第二个段落介绍 trafilatura 的两种模式：favor_recall 会把列表、表格和链接都尽量保留下来，favor_precision 则更偏向干净的文章正文。为了让正文长度超过检测阈值，这里再补充若干文字：网页抓取的核心难点在于渲染时机、提取策略与反爬对抗，三者共同决定了最终拿到的是完整正文还是残缺片段。我们按顺序处理这些环节。本段结尾标记 SENTENCE_TWO。</p>
+<h2>小节标题</h2>
+<p>第三个段落带一个链接，指向 <a href="https://example.org/target">示例链接文字</a>，用于验证 include_links 行为。这里继续补充一些无关痛痒的填充文字，用来拉长正文规模，使召回模式的结果足够稳定地超过精度模式的长度，从而可以检验 auto 策略确实选择了更完整的那个数据源。结尾标记 SENTENCE_THREE。</p>
+<table>
+<thead><tr><th>名称</th><th>数值</th></tr></thead>
+<tbody>
+<tr><td>表格行A</td><td>TABLE_VALUE_1</td></tr>
+<tr><td>表格行B</td><td>TABLE_VALUE_2</td></tr>
+</tbody>
+</table>
+<p>第四个段落是最后一个标记段落，正文中出现 SENTENCE_FOUR 后紧接一些重复填充以维持长度：正文提取、懒加载触发、折叠展开、反爬检测、策略择优。本段同时包含 <a href="https://example.org/second">第二个链接</a>。结尾标记 SENTENCE_FOUR。</p>
+</article>
+</main>
+</body>
+</html>

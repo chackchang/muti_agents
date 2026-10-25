@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>懒加载页面</title></head>
+<body>
+<main>
+<article>
+<h1>懒加载列表</h1>
+<p>初始正文段落，滚动后 JS 会追加更多段落。标记 LAZY_BASE。</p>
+<div id="more"></div>
+</article>
+</main>
+<div style="height:1500px"></div>
+<script>
+window.addEventListener('scroll', function () {
+  const box = document.getElementById('more');
+  if (box.getAttribute('data-filled')) return;
+  box.setAttribute('data-filled', '1');
+  for (let i = 1; i <= 6; i++) {
+    const p = document.createElement('p');
+    p.textContent = '第 ' + i + ' 段懒加载内容，标记 LAZY_ITEM_' + i +
+      '，这段文字在页面首次向下滚动之后才插入 DOM，用来验证滚动触发逻辑。' +
+      '为了拉长文本继续补充：滚动、等待、再滚动，直到页面高度稳定为止。';
+    box.appendChild(p);
+  }
+}, { passive: true });
+</script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>异步填充页面</title></head>
+<body>
+<main>
+<article>
+<h1>异步填充</h1>
+<p>初始正文段落，标记 LATE_BASE。</p>
+<div id="slot" style="height:60px;overflow:hidden"></div>
+</article>
+</main>
+<div style="height:1500px"></div>
+<script>
+window.addEventListener('scroll', function () {
+  if (window.__filled) return;
+  window.__filled = true;
+  setTimeout(function () {
+    document.getElementById('slot').textContent =
+      '延迟写入的内容，标记 LATE_ITEM。这段文字在滚动后 600ms 才出现，' +
+      '容器的固定高度让文档高度保持不变，用于验证内容签名不只看高度。';
+  }, 600);
+}, { passive: true });
+</script>
+</body>
+</html>
