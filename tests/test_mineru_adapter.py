@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 import zipfile
 from pathlib import Path
+
+import pytest
 
 from utils.adapters.docs.mineru import (
     _block_text,
@@ -13,6 +17,9 @@ from utils.adapters.docs.mineru import (
     _count_blocks,
     _export_images,
     _pick_caption,
+    _pid_alive,
+    _temp_workspace,
+    cleanup_stale_workspaces,
 )
 
 MARKDOWN = """# Demo paper
@@ -121,6 +128,68 @@ class TestBlockHelpers:
     def test_caption_from_markdown_ignores_body(self):
         lines = ["![](images/a.jpg)", "", "ordinary paragraph"]
         assert _caption_from_markdown(lines, 0) == ""
+
+
+class TestWorkspaceCleanup:
+    """临时目录的清理：正常/异常退出、以及被硬中断后的下次扫描。"""
+
+    def test_removed_on_normal_exit(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+        with _temp_workspace() as root:
+            (root / "docvortex-render-x" / "page-1.pixels").parent.mkdir()
+            (root / "docvortex-render-x" / "page-1.pixels").write_bytes(b"1")
+            assert root.is_dir()
+        assert not root.exists()
+
+    def test_removed_when_body_raises(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+        with pytest.raises(RuntimeError):
+            with _temp_workspace() as root:
+                raise RuntimeError("boom")
+        assert not root.exists()
+
+    def test_owner_marker_written(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+        with _temp_workspace() as root:
+            assert (root / ".owner").read_text() == str(os.getpid())
+
+    def test_sweep_removes_dead_owner(self, tmp_path):
+        stale = tmp_path / "mineru_parse_dead"
+        stale.mkdir()
+        (stale / ".owner").write_text("999999")
+        assert cleanup_stale_workspaces(tmp_path) == 1
+        assert not stale.exists()
+
+    def test_sweep_keeps_live_owner(self, tmp_path):
+        live = tmp_path / "mineru_parse_live"
+        live.mkdir()
+        (live / ".owner").write_text(str(os.getpid()))
+        assert cleanup_stale_workspaces(tmp_path) == 0
+        assert live.is_dir()
+
+    def test_sweep_keeps_fresh_unmarked_dir(self, tmp_path):
+        fresh = tmp_path / "mineru_parse_fresh"
+        fresh.mkdir()
+        assert cleanup_stale_workspaces(tmp_path) == 0
+        assert fresh.is_dir()
+
+    def test_sweep_removes_old_unmarked_dir(self, tmp_path):
+        old = tmp_path / "mineru_parse_old"
+        old.mkdir()
+        stale_time = time.time() - 3600
+        os.utime(old, (stale_time, stale_time))
+        assert cleanup_stale_workspaces(tmp_path) == 1
+        assert not old.exists()
+
+    def test_sweep_ignores_unrelated_dirs(self, tmp_path):
+        other = tmp_path / "other_dir"
+        other.mkdir()
+        assert cleanup_stale_workspaces(tmp_path) == 0
+        assert other.is_dir()
+
+    def test_pid_alive_detects_self_and_missing(self):
+        assert _pid_alive(os.getpid()) is True
+        assert _pid_alive(999999) is False
 
 
 class TestExportImages:

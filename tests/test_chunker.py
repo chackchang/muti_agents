@@ -13,7 +13,7 @@ pytest.importorskip("langchain_openai")
 pytest.importorskip("langchain_text_splitters")
 pytest.importorskip("agent.embedding_runtime")
 
-from utils.ingestion.chunker import ChunkingConfig, PDFSemanticChunker  # noqa: E402
+from utils.chunker.chunker import ChunkingConfig, PDFSemanticChunker  # noqa: E402
 
 TITLE = "A Study of Wire and Arc Additive Manufacturing Defects"
 

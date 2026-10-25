@@ -47,8 +47,9 @@ class IngestionConfig(BaseModel):
     reset_kb_before_ingest: bool = Field(default=False)
     sql_schema_path: str = Field(default="sql/schema.sql")
     exporter_out_path: str = Field(default="exported_documents")
+    verbose: bool = Field(default=False)
     # 提取选项
-    include_images: bool = Field(default=True)
+    include_images: bool = Field(default=False)
     include_tables: bool = Field(default=True)
     # 分块选项（默认值与 ChunkingConfig / 既有库保持一致，改动会改变指纹）
     chunk_size: int = Field(default=1000, ge=100, le=5000)

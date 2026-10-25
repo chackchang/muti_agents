@@ -18,8 +18,6 @@ from utils.db.db_utils import (
     db_pool,
     delete_document_vectors,
     execute_init_sql,
-    get_document,
-    get_document_pdf_bytes,
     initialize_database,
     upsert_chunk_vectors,
 )
@@ -27,10 +25,10 @@ from utils.db.db_utils import (
 from utils.embedding.embedding_runtime import aembed_texts_batched, get_embedding_model_name
 from agent.graph.graph_runtime import refresh_paper_graph
 from agent.config import ChunkingConfig, IngestionConfig, IngestionResult
-from utils.ingestion.chunker import DocumentChunk, create_chunker
+from utils.chunker.chunker import DocumentChunk, create_chunker
 from utils.norm.base import Document, Normalizer
 from utils.adapters.base import Adapter
-from utils.ingestion.vision_client import ArkVisionClient, figure_context
+from utils.chunker.vision_client import ArkVisionClient, figure_context
 
 filterwarnings("ignore", category=UserWarning)
 
@@ -175,13 +173,13 @@ class DocumentIngestionPipeline:
         }
 
     async def _ingest_single_document(self, file_path: str) -> IngestionResult:
-        """导入单个文档：adapter -> norm -> 归一化 JSON -> 分块 -> 向量化 -> 落库。"""
+        """导入单个文档：先做逻辑ID/指纹幂等把关，再交给共用落库流程。"""
         start_time = datetime.now()
-        
+
         # 指纹用 PDF 原始字节：MinerU 抽取非确定，抽取后的 content 不能当指纹
         pdf_bytes = Path(file_path).read_bytes()
         document_source = os.path.relpath(file_path, self.documents_folder)
-         # 幂等把关：解析前先算逻辑ID + 指纹，查库决定 append / update / skip。
+        # 幂等把关：解析前先算逻辑ID + 指纹，查库决定 append / update / skip。
         logical_id, fingerprint = self._compute_identity(pdf_bytes, document_source)
         existing = await self._find_current_document(logical_id)
         if existing is not None and existing["fingerprint"] == fingerprint:
@@ -195,9 +193,38 @@ class DocumentIngestionPipeline:
                 processing_time_ms=(datetime.now() - start_time).total_seconds() * 1000,
                 status="skipped",
             )
+
+        return await self._extract_and_persist(
+            file_path,
+            pdf_bytes=pdf_bytes,
+            document_source=document_source,
+            logical_id=logical_id,
+            fingerprint=fingerprint,
+            existing=existing,
+        )
+
+    async def _extract_and_persist(
+        self,
+        file_path: str,
+        *,
+        pdf_bytes: bytes,
+        document_source: str,
+        logical_id: str,
+        fingerprint: str,
+        existing: Optional[Dict[str, Any]],
+    ) -> IngestionResult:
+        """抽取 → 归一化 → 分块 → 向量化 → 落库。
+
+        ``existing`` 为空时 append；非空时走 update：版本号 +1，
+        新版本在 PostgreSQL 与 Qdrant 都落库成功后删除旧版本。
+        """
+        start_time = datetime.now()
+        mode = "update" if existing is not None else "append"
+        next_version = int(existing["version"]) + 1 if existing else 1
+
         print("INGEST_STAGE=extract", flush=True)
         raw_content, raw_metadata = self.extractor.read_document(file_path, "pdf")
-        
+
         # 归一化后后续流程只认这一个 JSON：{id, title, content, content_type, metadata}。
         # source 在归一化前换成相对路径：分块层会把它复制进每个 chunk，且 Document 的 id
         # 基于 source + content 计算，这样 id 与最终 metadata 保持一致。
@@ -209,9 +236,6 @@ class DocumentIngestionPipeline:
         document["title"] = document_title
         document["metadata"].setdefault("title", document_title)
 
-        
-        mode = "update" if existing is not None else "append"
-        next_version = int(existing["version"]) + 1 if existing else 1
         logger.info(
             "Document %s (logical_id=%s, mode=%s): %s",
             document_title,
@@ -326,61 +350,49 @@ class DocumentIngestionPipeline:
             )
             return None
 
-    # 升级文档到完整证据，无人调用
-    async def upgrade_document_to_full(self, document_id: str) -> IngestionResult:
-        """Rebuild one fast-ingested paper into full text/algorithm/table/figure evidence."""
-        document = await get_document(document_id)
-        pdf_bytes = await get_document_pdf_bytes(document_id)
-        if not document or not pdf_bytes:
-            raise ValueError("该论文没有保存可用于补充入库的原始 PDF")
+    async def upgrade_document_to_full(self, file_path: str) -> IngestionResult:
+        """人工更新：用磁盘上的 PDF 重新抽取并覆盖同一篇已入库文档。
 
-        import tempfile
-        with tempfile.TemporaryDirectory(prefix="upgrade_ingest_") as temp_dir:
-            path = Path(temp_dir) / "paper.pdf"
-            path.write_bytes(pdf_bytes)
-            content, metadata = self.extractor.read_document(str(path), "pdf")
-            metadata["include_artifacts"] = True
-            title = str(document["title"])
-            source = str(document["source"])
-            vision_chunks = await self._build_vision_chunks(content, metadata, title, source)
-            chunks = self.chunker.chunk_content(content, title=title, source=source, metadata=metadata)
-            chunks.extend(vision_chunks)
-            for index, chunk in enumerate(chunks):
-                chunk.index = index
-                chunk.metadata.update({"chunk_index": index, "total_chunks": len(chunks)})
-            embedded = await self.aembed_chunks(chunks)
-            await delete_document_vectors(document_id)
+        与批量入库的 update 分支完全一致：
+        1. 逻辑ID由 ``source`` 推导，指纹由 PDF 字节 + 配置推导；
+        2. 文档未入库 → 拒绝（升级只针对已有文档）；
+        3. 指纹一致 → ``skipped``，不碰任何库；
+        4. 指纹变化 → 生成新版本，PostgreSQL + Qdrant 都成功后再删除旧版本。
+        """
+        start_time = datetime.now()
 
-            vector_points: List[Dict[str, Any]] = []
-            async with db_pool.acquire() as conn:
-                async with conn.transaction():
-                    await conn.execute("DELETE FROM chunks WHERE document_id=$1::uuid", document_id)
-                    await conn.execute("DELETE FROM artifacts WHERE document_id=$1::uuid", document_id)
-                    await self._save_visual_artifacts(conn, document_id, embedded)
-                    for chunk in embedded:
-                        metadata_value = {**chunk.metadata, "chunk_type": chunk.metadata.get("content_type", "text")}
-                        row = await conn.fetchrow(
-                            """INSERT INTO chunks(document_id,content,chunk_index,metadata,token_count)
-                               VALUES($1::uuid,$2,$3,$4::jsonb,$5)
-                               RETURNING id::text""",
-                            document_id, chunk.content, chunk.index,
-                            json.dumps(metadata_value, ensure_ascii=False), chunk.token_count,
-                        )
-                        point = self._vector_point(row["id"], document_id, title, source, chunk, metadata_value)
-                        if point:
-                            vector_points.append(point)
-                    metadata["include_artifacts"] = True
-                    metadata["upgraded_to_full_at"] = datetime.now().isoformat()
-                    await conn.execute(
-                        "UPDATE documents SET content=$2, metadata=$3::jsonb, updated_at=CURRENT_TIMESTAMP WHERE id=$1::uuid",
-                        document_id, content, json.dumps(metadata, ensure_ascii=False),
-                    )
-            await upsert_chunk_vectors(vector_points)
-            try:
-                await refresh_paper_graph(document_id)
-            except Exception as exc:
-                logger.exception("Paper graph refresh failed for upgraded document %s: %s", document_id, exc)
-            return IngestionResult(document_id=document_id, title=title, chunks_created=len(embedded), processing_time_ms=0)
+        if not Path(file_path).is_file():
+            raise FileNotFoundError(f"PDF 不存在：{file_path}")
+
+        pdf_bytes = Path(file_path).read_bytes()
+        document_source = os.path.relpath(file_path, self.documents_folder)
+        logical_id, fingerprint = self._compute_identity(pdf_bytes, document_source)
+        existing = await self._find_current_document(logical_id)
+        if existing is None:
+            raise ValueError(
+                f"文档尚未入库，无法升级：source={document_source} "
+                f"(logical_id={logical_id})。请先通过 document_ingest_api 入库。"
+            )
+
+        if existing["fingerprint"] == fingerprint:
+            title = str(existing.get("title") or document_source).strip()
+            logger.info("Document unchanged (logical_id=%s), skip: %s", logical_id, title)
+            return IngestionResult(
+                document_id=existing["id"],
+                title=title,
+                chunks_created=0,
+                processing_time_ms=(datetime.now() - start_time).total_seconds() * 1000,
+                status="skipped",
+            )
+
+        return await self._extract_and_persist(
+            file_path,
+            pdf_bytes=pdf_bytes,
+            document_source=document_source,
+            logical_id=logical_id,
+            fingerprint=fingerprint,
+            existing=existing,
+        )
 
     async def _build_vision_chunks(
         self,
@@ -793,6 +805,79 @@ class DocumentIngestionPipeline:
                 )
         return len(old_document_ids)
 
+async def document_upgrade_api(
+    file_path: str,
+    config: IngestionConfig | None = None,
+) -> IngestionResult:
+    """人工更新接口：按 PDF 路径重新抽取并更新已入库的同一篇文档。
+
+    幂等规则与批量入库的 update 分支完全一致（逻辑ID + 指纹）：
+    - 文档未入库 → ``ValueError``；
+    - 指纹未变 → ``status="skipped"``，不做任何写操作；
+    - 指纹变化 → 新版本写入 PostgreSQL + Qdrant 后删除旧版本，``status="updated"``。
+
+    ``file_path`` 需要位于 ``config.documents_folder`` 之下：逻辑ID由相对
+    source 推导，路径不在其中会推导出不同的 source，从而被判定为“未入库”。
+    """
+    pipeline = DocumentIngestionPipeline(config=config)
+    await pipeline.initialize()
+    try:
+        return await pipeline.upgrade_document_to_full(file_path)
+    finally:
+        await pipeline.close()
+
+
+async def document_ingest_api(config: IngestionConfig):
+    '''学术文档pdf入库接口'''
+    log_level = logging.DEBUG if config.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    if config.include_images or config.include_tables:
+        logger.warning(
+            "Image/table extraction can be slow. Use --fast or --no-images --no-tables for faster text-only ingestion."
+        )
+
+    pipeline = DocumentIngestionPipeline(config=config)
+
+    def progress_callback(current: int, total: int):
+        logger.info(f"Progress: {current}/{total} documents processed")
+
+    try:
+        start_time = datetime.now()
+        results = await pipeline.ingest_documents(progress_callback)
+        end_time = datetime.now()
+        total_time = (end_time - start_time).total_seconds()
+
+        logger.info("\n" + "=" * 60)
+        logger.info("INGESTION SUMMARY")
+        logger.info("=" * 60)
+        logger.info(f"Documents processed: {len(results)}")
+        logger.info(f"Total chunks created: {sum(r.chunks_created for r in results)}")
+        logger.info(f"Images extracted: {pipeline.include_images}")
+        logger.info(f"Tables extracted: {pipeline.include_tables}")
+        logger.info(f"Total processing time: {total_time:.2f} seconds")
+        logger.info("=" * 60)
+
+        for result in results:
+            if result.status == "skipped":
+                logger.info(f"{result.title}: skipped (unchanged)")
+            elif result.status == "updated":
+                logger.info(f"{result.title}: {result.chunks_created} chunks (updated, {result.processing_time_ms/1000:.1f}s)")
+            elif result.chunks_created > 0:
+                logger.info(f"{result.title}: {result.chunks_created} chunks ({result.processing_time_ms/1000:.1f}s)")
+            else:
+                logger.warning(f"{result.title}: Failed to process")
+
+    except KeyboardInterrupt:
+        logger.warning("Ingestion interrupted by user")
+    except Exception as e:
+        logger.error(f"Ingestion failed: {e}")
+        raise
+    finally:
+        await pipeline.close()
 
 async def main():
     """运行导入流程的主函数。"""

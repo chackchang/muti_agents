@@ -1,4 +1,4 @@
--- 幂等建表脚本：由 utils.ingest 在初始化时通过 execute_init_sql 执行。
+-- 幂等建表脚本：由 utils.ingestion.PDF_ingest 在初始化时通过 execute_init_sql 执行。
 -- 向量检索已迁到 Qdrant；PostgreSQL 只保留文档/会话/分块正文/图证据/论文图。
 -- paper_graph_nodes.embedding 仍用 pgvector（论文级 profile 的余弦相似度在 SQL 里算）。
 

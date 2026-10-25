@@ -14,22 +14,171 @@ MinerU 的依赖与主项目冲突（要求 ``openai<3``），因此不放进本
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
+import threading
+import time
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+# ---------------------------------------------------------------------------
+# 临时目录生命周期
+#
+# MinerU/docvortex 会在自己的工作目录里写 docvortex-render-* 渲染缓存，单个文档
+# 可达数百 MB。正常结束与抛异常都走 finally 清理；但如果进程被 kill / TaskStop
+# 直接终止，Python 没有任何机会执行清理，只能在下一次解析开始时扫描残留目录。
+# 每个临时目录里放一个 ``.owner`` 记录占用它的 PID，扫到 PID 已消失的就删。
+# ---------------------------------------------------------------------------
+_TEMP_PREFIX = "mineru_parse_"
+_OWNER_MARKER = ".owner"
+# 没有 .owner 的目录可能是别的进程刚建好还没写标记，等得够久再清
+_UNMARKED_GRACE_SECONDS = 600
+_RMTREE_ATTEMPTS = 5
+_RMTREE_DELAY = 0.2
+
+_ACTIVE_WORKSPACES: set[Path] = set()
+_ACTIVE_LOCK = threading.Lock()
+
+
+def _pid_alive(pid: int) -> bool:
+    """判断 PID 是否仍在运行。Windows 上不能用 ``os.kill(pid, 0)``（会真的杀进程）。"""
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    import ctypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    ERROR_ACCESS_DENIED = 5
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # 没权限说明进程还在（属于别的用户），只有「找不到」才算死
+        return kernel32.GetLastError() == ERROR_ACCESS_DENIED
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _read_owner(path: Path) -> Optional[int]:
+    try:
+        return int((path / _OWNER_MARKER).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _force_remove(func, path: str, exc_info) -> None:
+    """rmtree 的 onerror：只读文件在 Windows 上删不掉，去掉只读位再试一次。"""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except OSError:
+        pass
+
+
+def _rmtree(path: Path) -> bool:
+    """尽力删除目录：子进程可能还占着文件句柄，重试几次再放弃。"""
+    for attempt in range(_RMTREE_ATTEMPTS):
+        try:
+            shutil.rmtree(path, onerror=_force_remove)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            last = exc
+            time.sleep(_RMTREE_DELAY * (attempt + 1))
+    logger.warning("Failed to remove MinerU temp dir %s: %s", path, last)
+    return False
+
+
+@contextmanager
+def _temp_workspace(prefix: str = _TEMP_PREFIX) -> Iterator[Path]:
+    """创建带 PID 标记的临时目录，退出时（含异常）尽力删除。"""
+    root = Path(tempfile.mkdtemp(prefix=prefix))
+    try:
+        (root / _OWNER_MARKER).write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+    with _ACTIVE_LOCK:
+        _ACTIVE_WORKSPACES.add(root)
+    try:
+        yield root
+    finally:
+        with _ACTIVE_LOCK:
+            _ACTIVE_WORKSPACES.discard(root)
+        _rmtree(root)
+
+
+def _cleanup_active_workspaces() -> None:
+    with _ACTIVE_LOCK:
+        pending = list(_ACTIVE_WORKSPACES)
+        _ACTIVE_WORKSPACES.clear()
+    for path in pending:
+        _rmtree(path)
+
+
+def cleanup_stale_workspaces(root: Optional[Path] = None) -> int:
+    """删除被硬中断留下的临时目录，返回清理个数。
+
+    ``root`` 默认取系统临时目录。PID 还活着（并发解析中）或刚建好还没写标记的
+    目录会跳过。
+    """
+    base = Path(root) if root is not None else Path(tempfile.gettempdir())
+    if not base.is_dir():
+        return 0
+
+    removed = 0
+    for path in base.glob(f"{_TEMP_PREFIX}*"):
+        if not path.is_dir() or path.is_symlink():
+            continue
+        with _ACTIVE_LOCK:
+            if path in _ACTIVE_WORKSPACES:
+                continue
+        owner = _read_owner(path)
+        if owner is not None:
+            if _pid_alive(owner):
+                continue
+        else:
+            try:
+                age = time.time() - path.stat().st_mtime
+            except OSError:
+                continue
+            if age < _UNMARKED_GRACE_SECONDS:
+                continue
+        if _rmtree(path):
+            removed += 1
+            logger.info("Cleaned stale MinerU temp dir: %s", path)
+    return removed
+
+
+atexit.register(_cleanup_active_workspaces)
 
 # zip 里的图片引用，例如 ![](images/page_3_image_2.jpg)
 _MARKDOWN_IMAGE = re.compile(
@@ -215,7 +364,10 @@ class MinerUExtractor:
         asset_dir = Path(asset_dir)
         digest = hashlib.sha256(pdf_path.read_bytes()).hexdigest()[:16]
 
-        with tempfile.TemporaryDirectory(prefix="mineru_parse_") as temp_dir:
+        # 先扫掉上次被硬中断留下的目录，再开始本次解析
+        cleanup_stale_workspaces()
+
+        with _temp_workspace() as temp_dir:
             zip_path = Path(temp_dir) / f"{pdf_path.stem}.zip"
             self._run(pdf_path, zip_path)
             with zipfile.ZipFile(zip_path) as archive:

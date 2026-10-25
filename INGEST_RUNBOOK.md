@@ -126,7 +126,7 @@ ingest 启动时 `initialize()` 会自动执行 `sql/schema.sql`，所以正常�
 ### 3. 跑 ingest
 
 ```
-.venv/Scripts/python.exe -m utils.ingest --documents data/test1/ --no-images
+.venv/Scripts/python.exe -m utils.ingestion.PDF_ingest  --documents data/test1/ --no-images
 ```
 
 - `--documents data`：PDF 在 `data/`（CLI 默认是 `documents`，别漏）。

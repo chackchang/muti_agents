@@ -781,6 +781,13 @@ class PDFSemanticChunker:
 
         # return final_chunks
 
+        # 没有任何 markdown 章节（例如 PDFium 兜底的纯文本）时，明确返回空列表；
+        # 否则函数会隐式返回 None，调用方 extend(None) 会抛 TypeError。
+        logger.warning(
+            "No markdown sections found for %s; no chunks produced", title
+        )
+        return []
+
     @staticmethod
     def _coerce_pdf_document(item: Any) -> Tuple[str, Dict[str, Any]]:
         """把 exporter JSON 或 LangChain Document 统一成 (content, metadata)。"""
