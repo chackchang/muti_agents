@@ -15,9 +15,8 @@ from agent.evidence.evidence_citation_runtime import (
     format_evidence_references_for_prompt,
     review_answer_citations,
 )
+from agent.model.intent_models import IntentPlan, PlannerCapabilities
 from .intent_planner import (
-    IntentPlan,
-    PlannerCapabilities,
     build_fallback_intent_plan,
     plan_final_retrieval_debug,
     plan_user_intent_debug,

@@ -7,7 +7,7 @@ against it, so tool selection cannot silently cross source boundaries.
 
 from typing import Any, Dict, Iterable, List, Tuple
 
-from agent.orchestration.intent_planner import IntentPlan, RetrievalStep
+from agent.model.intent_models import IntentPlan, RetrievalStep
 from .retrieval_harness_schema import (
     RetrievalContract,
     RetrievalContractEvaluation,

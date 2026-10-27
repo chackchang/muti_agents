@@ -3,7 +3,7 @@
 import re
 from typing import Any, Dict, List, Tuple
 
-from agent.orchestration.intent_planner import IntentPlan
+from agent.model.intent_models import IntentPlan
 
 
 def _normalize_path(value: Any) -> str:

@@ -24,25 +24,25 @@ from agent.infrastructure.runtime_metrics import get_runtime_metrics_snapshot
 from agent.infrastructure.runtime_models import HttpMetricsSnapshot, RuntimeDiagnostics
 from agent.infrastructure.chat_metrics_models import ChatMetricsSnapshot
 from agent.infrastructure.chat_metrics_runtime import get_chat_metrics_snapshot, record_chat_request_metric
-from agent.orchestration.agent_runtime import AgentDependencies
-from agent.orchestration.agent_langgraph import run_langgraph_analysis
-from agent.retrieval.harness.retrieval_harness_runtime import build_retrieval_harness_trace_payload
-from agent.orchestration.agent_langchain import (
+from agent.orchestration import (
+    AgentDependencies,
     GENERATION_RETRY_FAILED_MESSAGE,
-    run_langchain_agent,
-    stream_langchain_agent,
-    iter_langchain_agent_stream,
     get_langchain_chat_model,
+    iter_langchain_agent_stream,
     retry_langchain_agent_after_degenerate,
+    run_langchain_agent,
+    run_langgraph_analysis,
+    stream_langchain_agent,
 )
+from agent.retrieval.harness.retrieval_harness_runtime import build_retrieval_harness_trace_payload
 from agent.orchestration.routing import (
-    _is_general_algorithm_question,
-    _is_local_kb_question,
-    _may_need_general_web_search,
-    _run_local_kb_preflight_if_needed,
-    _dedupe_sources,
-    _build_format_instruction,
-    _build_tool_choice_instruction,
+    is_general_algorithm_question,
+    is_local_kb_question,
+    needs_general_web_search,
+    run_local_kb_preflight_if_needed,
+    dedupe_sources,
+    build_format_instruction,
+    build_tool_choice_instruction,
     has_unverified_web_citations,
     is_degenerate_answer,
 )
@@ -880,10 +880,10 @@ async def prepare_chat_runtime(request: ChatRequest) -> ChatRuntime:
         latest_query=request.message,
         history_messages=history_messages,
     )
-    is_general_question = _is_general_algorithm_question(request.message)
-    may_need_general_web_search = _may_need_general_web_search(request.message)
+    is_general_question = is_general_algorithm_question(request.message)
+    may_need_general_web_search = needs_general_web_search(request.message)
     explicit_general_web_request = _is_explicit_general_web_request(request.message)
-    is_local_question = _is_local_kb_question(retrieval_query)
+    is_local_question = is_local_kb_question(retrieval_query)
     simple_chat_decision = choose_simple_chat_strategy(
         message=request.message,
         resolved_query=retrieval_query,
@@ -894,14 +894,14 @@ async def prepare_chat_runtime(request: ChatRequest) -> ChatRuntime:
 
     local_context = ""
     if is_local_question:
-        local_context = await _run_local_kb_preflight_if_needed(retrieval_query, deps)
+        local_context = await run_local_kb_preflight_if_needed(retrieval_query, deps)
     has_local_evidence = bool(local_context)
 
-    format_instruction = _build_format_instruction(
+    format_instruction = build_format_instruction(
         has_local_evidence=has_local_evidence,
         is_general_question=is_general_question,
     )
-    tool_choice_instruction = _build_tool_choice_instruction(
+    tool_choice_instruction = build_tool_choice_instruction(
         is_general_question=is_general_question,
         may_need_web=may_need_general_web_search,
         has_local_evidence=has_local_evidence,
@@ -1048,7 +1048,7 @@ async def execute_prepared_chat_runtime(
         )
         if not sources and not strict_langgraph_scope:
             sources = list(getattr(deps, "retrieved_sources", []) or [])
-        sources = _dedupe_sources(sources)
+        sources = dedupe_sources(sources)
         response = _normalize_web_unavailable_reply(
             response,
             requested_web=runtime.effective_use_web_search,
@@ -1509,7 +1509,7 @@ async def chat_stream(request: ChatRequest):
                         stream_backend = "simple_chat_runtime"
                         full_response = simple_chat_result.message
                         tools_used = list(simple_chat_result.tools_used or [])
-                        sources = _dedupe_sources(list(simple_chat_result.sources or []))
+                        sources = dedupe_sources(list(simple_chat_result.sources or []))
                         workflow_metadata = dict(simple_chat_result.metadata or {})
                         full_response = clean_legacy_warning_text(clean_markdown_spacing(full_response))
                         review_result = review_generated_answer(
@@ -1842,7 +1842,7 @@ async def chat_stream(request: ChatRequest):
                 )
                 if not sources and not strict_langgraph_scope:
                     sources = list(getattr(deps, "retrieved_sources", []) or [])
-                sources = _dedupe_sources(sources)
+                sources = dedupe_sources(sources)
                 if not had_user_visible_text:
                     full_response = _normalize_web_unavailable_reply(
                         full_response,
@@ -2000,7 +2000,7 @@ async def chat_stream(request: ChatRequest):
                 )
                 try:
                     if full_response.strip() and deps is not None:
-                        sources_data = [source.model_dump() for source in _dedupe_sources(sources)]
+                        sources_data = [source.model_dump() for source in dedupe_sources(sources)]
                         await asyncio.shield(
                             add_message(
                                 session_id=session_id,

@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional, Tuple
 
-from .intent_planner import IntentPlan, PlannerCapabilities, RetrievalStep
+from agent.model.intent_models import IntentPlan, PlannerCapabilities, RetrievalStep
 from agent.retrieval.external_retrieval_resilience import parse_external_retrieval_status
 from agent.tools.tool_specs import get_tool_source_type
 

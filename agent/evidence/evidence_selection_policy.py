@@ -3,7 +3,7 @@
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
-from agent.orchestration.intent_planner import IntentPlan
+from agent.model.intent_models import IntentPlan
 from agent.http_api.reranker_client import rerank_documents
 
 
