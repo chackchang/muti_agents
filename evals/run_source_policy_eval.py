@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from agent.intent_planner import PlannerCapabilities, plan_user_intent_debug
+from agent.orchestration.intent_planner import PlannerCapabilities, plan_user_intent_debug
 from common.encoding_utils import read_json_robust, write_json_utf8, write_text_utf8
 
 

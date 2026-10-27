@@ -1,7 +1,7 @@
 import json
 from typing import Any, Dict, Optional
 
-from .app_config import get_ingestion_dlq_name, get_ingestion_queue_name, get_rabbitmq_url
+from agent.infrastructure.app_config import get_ingestion_dlq_name, get_ingestion_queue_name, get_rabbitmq_url
 
 
 def build_ingestion_task_message(

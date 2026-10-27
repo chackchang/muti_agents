@@ -8,25 +8,26 @@ from datetime import datetime
 import uuid
 import re
 import asyncio
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from dotenv import load_dotenv
 
-from .http_errors import register_exception_handlers
-from .http_middleware import register_http_middleware
-from .health_runtime import APP_VERSION, build_readiness_status
-from .cache_utils import close_redis_client, startup_redis_client
-from .runtime_config import build_runtime_diagnostics
-from .runtime_metrics import get_runtime_metrics_snapshot
-from .runtime_models import HttpMetricsSnapshot, RuntimeDiagnostics
-from .chat_metrics_models import ChatMetricsSnapshot
-from .chat_metrics_runtime import get_chat_metrics_snapshot, record_chat_request_metric
-from .agent_runtime import AgentDependencies
-from .agent_langgraph import run_langgraph_analysis
-from .retrieval_harness_runtime import build_retrieval_harness_trace_payload
-from .agent_langchain import (
+from agent.http_api.http_errors import register_exception_handlers
+from agent.http_api.http_middleware import register_http_middleware
+from agent.infrastructure.health_runtime import APP_VERSION, build_readiness_status
+from agent.cache.cache_utils import close_redis_client, startup_redis_client
+from agent.infrastructure.runtime_config import build_runtime_diagnostics
+from agent.infrastructure.runtime_metrics import get_runtime_metrics_snapshot
+from agent.infrastructure.runtime_models import HttpMetricsSnapshot, RuntimeDiagnostics
+from agent.infrastructure.chat_metrics_models import ChatMetricsSnapshot
+from agent.infrastructure.chat_metrics_runtime import get_chat_metrics_snapshot, record_chat_request_metric
+from agent.orchestration.agent_runtime import AgentDependencies
+from agent.orchestration.agent_langgraph import run_langgraph_analysis
+from agent.retrieval.harness.retrieval_harness_runtime import build_retrieval_harness_trace_payload
+from agent.orchestration.agent_langchain import (
     GENERATION_RETRY_FAILED_MESSAGE,
     run_langchain_agent,
     stream_langchain_agent,
@@ -34,7 +35,7 @@ from .agent_langchain import (
     get_langchain_chat_model,
     retry_langchain_agent_after_degenerate,
 )
-from .routing import (
+from agent.orchestration.routing import (
     _is_general_algorithm_question,
     _is_local_kb_question,
     _may_need_general_web_search,
@@ -45,8 +46,8 @@ from .routing import (
     has_unverified_web_citations,
     is_degenerate_answer,
 )
-from .sse_utils import sse_event, stream_response
-from .db_utils import (
+from agent.http_api.sse_utils import sse_event, stream_response
+from agent.cache.db_utils import (
     execute_init_sql,
     initialize_database,
     close_database,
@@ -72,6 +73,7 @@ from .db_utils import (
     delete_user_memory_item,
     get_artifact,
     get_artifact_image,
+    get_document,
     get_document_pdf,
     delete_document,
     list_document_annotations,
@@ -79,11 +81,11 @@ from .db_utils import (
     update_document_annotation_position,
     delete_document_annotation,
 )
-from .pdf_page_renderer import render_cached_pdf_page_png
-from .translation_error_policy import is_translation_service_unavailable
-from .app_config import get_rabbitmq_url
-from .openalex_router import _is_openalex_enabled
-from .ingestion_tasks_db import (
+from agent.documents.pdf_page_renderer import render_cached_pdf_page_png
+from agent.documents.translation_error_policy import is_translation_service_unavailable
+from agent.infrastructure.app_config import get_rabbitmq_url
+from agent.providers.openalex_router import _is_openalex_enabled
+from agent.ingestion.ingestion_tasks_db import (
     delete_ingestion_task,
     get_ingestion_task,
     list_ingestion_tasks,
@@ -92,7 +94,7 @@ from .ingestion_tasks_db import (
     resume_ingestion_task as resume_ingestion_task_record,
     update_ingestion_task_status,
 )
-from .models import (
+from agent.model.models import (
     ChatRequest,
     ChatResponse,
     SearchRequest,
@@ -113,7 +115,7 @@ from .models import (
     UserMemoryResponse,
     UserMemoryItemResponse,
 )
-from .tools import (
+from agent.retrieval.tools import (
     vector_search_tool,
     hybrid_search_tool,
     list_documents_tool,
@@ -123,9 +125,9 @@ from .tools import (
     is_general_web_search_enabled,
     get_general_web_search_provider,
 )
-from .prompts import SYSTEM_PROMPT
-from .providers import test_llm_connection
-from .memory_utils import (
+from agent.orchestration.prompts.prompts import SYSTEM_PROMPT
+from agent.providers.providers import test_llm_connection
+from agent.memory.memory_utils import (
     build_context,
     build_memory_update_prompt,
     memory_eligible_messages,
@@ -135,52 +137,52 @@ from .memory_utils import (
     has_memory_content,
     should_update_memory,
 )
-from .memory_runtime import build_session_memory_snapshot
-from .user_memory_runtime import (
+from agent.providers.memory_runtime import build_session_memory_snapshot
+from agent.memory.user_memory_runtime import (
     build_user_memory_contexts,
     merge_user_memory_items,
     normalize_user_memory_profile,
 )
-from .long_term_memory_runtime import (
+from agent.memory.long_term_memory_runtime import (
     automatic_memory_allowed,
     extract_user_long_term_memory_candidates,
 )
-from .dialog_policy import classify_dialog_turn
-from .history_resolver import resolve_history_query
-from .query_rewrite_runtime import (
+from agent.orchestration.dialog_policy import classify_dialog_turn
+from agent.orchestration.history_resolver import resolve_history_query
+from agent.retrieval.query_rewrite_runtime import (
     build_query_rewrite_context,
     get_query_rewrite_model,
     rewrite_query_with_conversation,
 )
-from .answer_review_runtime import review_generated_answer
-from .retrieval_failure_policy import (
+from agent.evidence.answer_review_runtime import review_generated_answer
+from agent.retrieval.retrieval_failure_policy import (
     apply_external_retrieval_failure_policy,
     build_external_retrieval_disclosure,
 )
-from .simple_chat_runtime import (
+from agent.orchestration.simple_chat_runtime import (
     SimpleChatDecision,
     choose_simple_chat_strategy,
     run_simple_chat_runtime,
 )
-from .ingestion_jobs import (
+from agent.ingestion.ingestion_jobs import (
     add_openalex_file_to_kb,
     submit_async_ingestion_task,
     submit_async_ingestion_tasks,
 )
-from .rabbitmq_producer import publish_ingestion_task
-from .stream_registry import (
+from agent.ingestion.rabbitmq_producer import publish_ingestion_task
+from agent.http_api.stream_registry import (
     register_stream_run,
     unregister_stream_run,
     cancel_stream_run,
     get_stream_run,
 )
-from .warning_text import clean_legacy_warning_text
-from .request_context import get_request_id
-from .document_reader_runtime import stream_document_translation, translate_document
-from .selection_translation_runtime import translate_selection
-from .graph_runtime import ensure_paper_graph, get_paper_graph
-from .graph_localization_runtime import schedule_pending_graph_localizations
-from .graph_schema import PaperGraphResponse
+from agent.infrastructure.warning_text import clean_legacy_warning_text
+from agent.infrastructure.request_context import get_request_id
+from agent.documents.document_reader_runtime import stream_document_translation, translate_document
+from agent.documents.selection_translation_runtime import translate_selection
+from agent.knowledge_graph.graph_runtime import ensure_paper_graph, get_paper_graph
+from agent.knowledge_graph.graph_localization_runtime import schedule_pending_graph_localizations
+from agent.knowledge_graph.graph_schema import PaperGraphResponse
 
 load_dotenv()
 
@@ -2356,18 +2358,38 @@ async def delete_document_endpoint(document_id: str):
 @app.post("/documents/{document_id}/upgrade-full")
 async def upgrade_document_to_full_endpoint(document_id: str):
     """Supplement a fast ingestion with the complete evidence extraction pipeline."""
-    from ingestion.ingest import DocumentIngestionPipeline
-    from .models import IngestionConfig
+    from agent.config import IngestionConfig
+    from utils.ingestion.PDF_ingest import document_upgrade_api
 
-    pipeline = DocumentIngestionPipeline(IngestionConfig(), include_images=True, include_tables=True)
+    document = await get_document(document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # 升级按「相对 documents_folder 的 source」重新推导逻辑ID，必须用入库时那套根目录，
+    # 否则会被判定为"未入库"。库里没存根目录，按常见位置依次找一遍。
+    source = str(document.get("source") or "").strip()
+    resolved: Optional[tuple[str, str]] = None
+    for root in ("documents", "data", "."):
+        candidate = Path(root) / source
+        if source and candidate.is_file():
+            resolved = (str(candidate), root)
+            break
+    if resolved is None:
+        raise HTTPException(status_code=409, detail=f"Source PDF is not available on disk: {source or 'unknown'}")
+
+    file_path, documents_root = resolved
     try:
-        await pipeline.initialize()
-        result = await pipeline.upgrade_document_to_full(document_id)
+        result = await document_upgrade_api(
+            file_path,
+            config=IngestionConfig(
+                documents_folder=documents_root,
+                include_images=True,
+                include_tables=True,
+            ),
+        )
         return {"status": "succeeded", **result.model_dump()}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    finally:
-        await pipeline.close()
 
 
 @app.get("/sessions/{session_id}/memory", response_model=SessionMemorySnapshot)
@@ -2567,10 +2589,12 @@ async def resume_ingestion_task(task_id: str):
             fast=bool(task.get("fast", False)),
         )
     except Exception as exc:
+        # 只有任务还停在 resume 写入的 queued 时才回退；若已被 worker 接管就不覆盖
         await update_ingestion_task_status(
             task_id=task_id,
             status="paused_quota",
             error_message=f"额度已恢复但任务重新投递失败：{str(exc)[:360]}",
+            expected_status="queued",
         )
         raise HTTPException(status_code=503, detail="Failed to requeue ingestion task") from exc
     return IngestionTaskResponse(**task)

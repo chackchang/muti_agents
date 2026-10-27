@@ -1,8 +1,8 @@
 from typing import Any, Dict, List, Optional
 
-from .agent_runtime import AgentDependencies, _collect_evidence_hit
-from .external_retrieval_resilience import parse_external_retrieval_status
-from .tools import (
+from agent.orchestration.agent_runtime import AgentDependencies, _collect_evidence_hit
+from agent.retrieval.external_retrieval_resilience import parse_external_retrieval_status
+from agent.retrieval.tools import (
     ArtifactSearchInput,
     DocumentInput,
     DocumentListInput,

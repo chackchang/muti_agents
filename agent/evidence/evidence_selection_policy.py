@@ -3,8 +3,8 @@
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
-from .intent_planner import IntentPlan
-from .reranker_client import rerank_documents
+from agent.orchestration.intent_planner import IntentPlan
+from agent.http_api.reranker_client import rerank_documents
 
 
 TEXT_CANDIDATE_LIMIT = 20

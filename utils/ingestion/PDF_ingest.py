@@ -23,7 +23,7 @@ from utils.db.db_utils import (
 )
 
 from utils.embedding.embedding_runtime import aembed_texts_batched, get_embedding_model_name
-from agent.graph.graph_runtime import refresh_paper_graph
+from agent.knowledge_graph.graph_runtime import refresh_paper_graph
 from agent.config import ChunkingConfig, IngestionConfig, IngestionResult
 from utils.chunker.chunker import DocumentChunk, create_chunker
 from utils.norm.base import Document, Normalizer
@@ -870,6 +870,9 @@ async def document_ingest_api(config: IngestionConfig):
                 logger.info(f"{result.title}: {result.chunks_created} chunks ({result.processing_time_ms/1000:.1f}s)")
             else:
                 logger.warning(f"{result.title}: Failed to process")
+
+        # 子进程调用方（如 ingestion_worker）需要 document_id 才能回写任务状态
+        return results
 
     except KeyboardInterrupt:
         logger.warning("Ingestion interrupted by user")

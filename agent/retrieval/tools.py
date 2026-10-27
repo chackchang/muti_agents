@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-from .db_utils import (
+from agent.cache.db_utils import (
     vector_search,
     hybrid_search,
     section_search,
@@ -21,11 +21,11 @@ from .db_utils import (
     list_documents,
     get_document_chunks,
 )
-from .models import ChunkResult, DocumentMetadata
+from agent.model.models import ChunkResult, DocumentMetadata
 from .retrieval_ranking import merge_ranked_chunk_results
-from .providers import build_embedding_request_kwargs, get_embedding_client, get_embedding_model
-from .embedding_runtime import EmbeddingLanguage, get_embedding_client_for_route, get_embedding_route
-from .cache_utils import cache_get_json, cache_set_json, make_cache_key
+from agent.providers.providers import build_embedding_request_kwargs, get_embedding_client, get_embedding_model
+from utils.embedding.embedding_runtime import EmbeddingLanguage, get_embedding_client_for_route, get_embedding_route
+from agent.cache.cache_utils import cache_get_json, cache_set_json, make_cache_key
 from .query_translation_runtime import translate_query_to_english
 from .external_retrieval_resilience import (
     not_configured_external_retrieval,

@@ -7,8 +7,8 @@ import time
 import uuid
 from pathlib import Path
 
-from agent.agent_langgraph import run_langgraph_analysis
-from agent.agent_runtime import AgentDependencies
+from agent.orchestration.agent_langgraph import run_langgraph_analysis
+from agent.orchestration.agent_runtime import AgentDependencies
 from common.encoding_utils import read_json_robust, write_json_utf8
 from evals.corpus_qa_eval_runtime import _as_dict, _score_case
 

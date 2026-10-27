@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List
 
-from .memory_utils import has_memory_content
+from agent.memory.memory_utils import has_memory_content
 
 if TYPE_CHECKING:
     from langchain_openai import ChatOpenAI

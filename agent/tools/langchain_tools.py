@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
-from .agent_runtime import AgentDependencies, _resolve_default_search_type
+from agent.orchestration.agent_runtime import AgentDependencies, _resolve_default_search_type
 from .tool_payloads import (
     collect_hits,
     record_external_retrieval_status,
@@ -15,8 +15,8 @@ from .tool_payloads import (
     run_section_search_payload,
     run_vector_search_payload,
 )
-from .external_retrieval_resilience import parse_external_retrieval_status
-from .tools import (
+from agent.retrieval.external_retrieval_resilience import parse_external_retrieval_status
+from agent.retrieval.tools import (
     web_search_tool,
     WebSearchInput,
 )

@@ -1,12 +1,18 @@
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional, Sequence
+from typing import Any, Dict, Literal, Optional, Sequence, get_args
 
-from .db_utils import db_pool
+from agent.cache.db_utils import db_pool
 
 IngestionTaskStatus = Literal[
     "queued", "processing", "paused", "done", "failed", "paused_quota", "deleted"
 ]
+_VALID_TASK_STATUSES = frozenset(get_args(IngestionTaskStatus))
+# 状态跃迁的前置条件：可以是单个状态，也可以是一组（例如「处理中被重投递」）。
+ExpectedTaskStatus = IngestionTaskStatus | Sequence[IngestionTaskStatus]
+# 显式声明「不设前置条件、覆盖任何状态」。只有确实要强制改写时才传，
+# 不提供隐式默认值——忘记传 expected_status 会直接报错，而不是静默放行。
+ALL_TASK_STATUSES: tuple[str, ...] = get_args(IngestionTaskStatus)
 
 _TASK_COLUMNS = """
     task_id, document_id::text, file_path, filename, fast, status, queue_order,
@@ -93,6 +99,27 @@ async def get_next_queued_ingestion_task() -> Optional[Dict[str, Any]]:
         return _serialize_ingestion_task(row) if row else None
 
 
+def _normalize_expected_status(expected_status: ExpectedTaskStatus) -> list[str]:
+    """把 expected_status 归一化成非空的 text[]。
+
+    不给 ``None`` 留通道：没有前置条件就等于没有保护。需要强制改写时传
+    ``ALL_TASK_STATUSES``，让"我不校验"这件事在调用点可见。
+    """
+    if expected_status is None:
+        raise TypeError(
+            "expected_status is required: pass the statuses this update expects, "
+            "or ALL_TASK_STATUSES to overwrite regardless of the current status"
+        )
+    values = [expected_status] if isinstance(expected_status, str) else list(expected_status)
+    if not values:
+        raise ValueError("expected_status must list at least one status")
+    invalid = [value for value in values if value not in _VALID_TASK_STATUSES]
+    if invalid:
+        raise ValueError(f"invalid expected_status: {invalid}")
+    # 去重但保序，便于调用方按「正常路径 → 兜底路径」书写
+    return list(dict.fromkeys(values))
+
+
 async def update_ingestion_task_status(
     task_id: str,
     status: IngestionTaskStatus,
@@ -103,7 +130,22 @@ async def update_ingestion_task_status(
     finished_at: Optional[datetime] = None,
     progress_percent: Optional[int] = None,
     progress_stage: Optional[str] = None,
+    *,
+    expected_status: ExpectedTaskStatus,
 ) -> Optional[Dict[str, Any]]:
+    """Update a task status as a guarded state transition.
+
+    ``expected_status`` 把这次写入变成一次「比较并交换」：只有当前状态在给定集合内才会生效，
+    由数据库在同一个 UPDATE 里原子校验，避免 worker 与应用侧并发写入时互相覆盖
+    （典型场景：用户暂停/删除任务的同时，worker 正好在写进度或完成状态）。
+
+    参数是**必填**的，没有隐式默认值：每次写入都必须说明"我认为它现在是什么状态"。
+    确实要无条件覆盖时传 ``ALL_TASK_STATUSES``。
+
+    返回 ``None`` 表示这次没有写成——任务不存在，或当前状态已不是预期。
+    需要区分两者时，调用方自行 ``get_ingestion_task`` 复查。
+    """
+    expected = _normalize_expected_status(expected_status)
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             f"""
@@ -112,10 +154,12 @@ async def update_ingestion_task_status(
                 started_at=COALESCE($6, started_at), finished_at=COALESCE($7, finished_at),
                 progress_percent=COALESCE($8, progress_percent),
                 progress_stage=COALESCE($9, progress_stage), updated_at=CURRENT_TIMESTAMP
-            WHERE task_id=$1 RETURNING {_TASK_COLUMNS}
+            WHERE task_id=$1 AND status = ANY($10::text[])
+            RETURNING {_TASK_COLUMNS}
             """,
             task_id, status, document_id, error_message, retry_count, started_at, finished_at,
             max(0, min(100, progress_percent)) if progress_percent is not None else None, progress_stage,
+            expected,
         )
         return _serialize_ingestion_task(row) if row else None
 

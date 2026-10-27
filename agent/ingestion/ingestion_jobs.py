@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import binascii
+import json
 import os
 import re
 import shutil
@@ -19,6 +20,37 @@ from .ingestion_tasks_db import create_ingestion_task, update_ingestion_task_sta
 from .rabbitmq_producer import publish_ingestion_task
 
 DOCUMENT_UPLOAD_MAX_BYTES = int(os.getenv("DOCUMENT_UPLOAD_MAX_BYTES", str(30 * 1024 * 1024)))
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# 上传与 OpenAlex 导入都落在 documents/ 下。逻辑ID由「相对该根目录的路径」推导，
+# 这里必须和建目录时用同一个根，否则重试会被当成一篇新文档。
+DOCUMENTS_ROOT = Path(os.getenv("INGEST_DOCUMENTS_ROOT", "documents"))
+
+# 子进程入口：PDF_ingest 对外暴露的是 async 函数而不是 CLI 模块，
+# 由引导脚本 import 后 asyncio.run，最后把结果打成一行机器可读的 JSON。
+# 引导脚本写成文件再执行，避免多行字符串走 Windows 命令行引号解析。
+_INGEST_BOOTSTRAP = r"""
+import asyncio
+import json
+import sys
+
+project_root, documents_folder, fast = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+sys.path.insert(0, project_root)
+
+from agent.config import IngestionConfig
+from utils.ingestion.PDF_ingest import document_ingest_api
+
+config = IngestionConfig(
+    documents_folder=documents_folder,
+    include_images=not fast,
+    include_tables=not fast,
+    verbose=True,
+)
+results = asyncio.run(document_ingest_api(config)) or []
+print("INGEST_RESULT=" + json.dumps([r.model_dump() for r in results], ensure_ascii=False), flush=True)
+"""
+
+_INGEST_RESULT_MARKER = "INGEST_RESULT="
 
 
 def _safe_filename(seed: str) -> str:
@@ -75,8 +107,12 @@ async def _enqueue_file(file_path: Path, *, fast: bool) -> Dict[str, Any]:
             fast=fast,
         )
     except Exception as exc:
+        # 任务刚由 create_ingestion_task 落库为 queued；若期间已被删除则不再改写
         updated = await update_ingestion_task_status(
-            task_id=str(task["task_id"]), status="failed", error_message=str(exc)
+            task_id=str(task["task_id"]),
+            status="failed",
+            error_message=str(exc),
+            expected_status="queued",
         )
         raise HTTPException(
             status_code=503,
@@ -101,11 +137,51 @@ async def submit_async_ingestion_tasks(payloads: list[Dict[str, Any]]) -> list[D
     return [await submit_async_ingestion_task(payload) for payload in payloads]
 
 
-def _build_ingestion_command(import_dir: Path, *, fast: bool = False) -> list[str]:
-    cmd = [sys.executable, "-u", "-m", "ingestion.ingest", "--documents", str(import_dir), "--verbose"]
-    if fast:
-        cmd.extend(["--no-semantic", "--no-images", "--no-tables"])
-    return cmd
+def _document_source(path: Path) -> str:
+    """逻辑ID的输入：相对 documents/ 的稳定路径，与临时目录、随机前缀都无关。
+
+    用 ``os.path.relpath`` 而不是 ``as_posix``，保证与 pipeline 内部的
+    ``os.path.relpath(file_path, documents_folder)`` 逐字符一致（Windows 下是反斜杠）。
+    """
+    try:
+        return os.path.relpath(path.resolve(), DOCUMENTS_ROOT.resolve())
+    except ValueError:
+        # 跨盘符时退回文件名，同样与物理位置无关
+        return path.name
+
+
+def _build_ingestion_command(script_path: Path, documents_folder: Path, *, fast: bool = False) -> list[str]:
+    return [
+        sys.executable,
+        "-u",
+        str(script_path),
+        str(PROJECT_ROOT),
+        str(documents_folder),
+        "1" if fast else "0",
+    ]
+
+
+def _parse_ingest_result(lines: list[str]) -> Dict[str, Any]:
+    """从子进程 stdout 里取出 document_ingest_api 的返回值。"""
+    for line in reversed(lines):
+        if _INGEST_RESULT_MARKER not in line:
+            continue
+        try:
+            payload = json.loads(line.split(_INGEST_RESULT_MARKER, 1)[1])
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(payload, list) or not payload:
+            return {}
+        first = payload[0]
+        if not isinstance(first, dict):
+            return {}
+        return {
+            "document_id": first.get("document_id"),
+            "document_title": first.get("title"),
+            "chunks_created": first.get("chunks_created"),
+            "document_status": first.get("status"),
+        }
+    return {}
 
 
 async def ingest_saved_pdf_file(
@@ -115,15 +191,28 @@ async def ingest_saved_pdf_file(
     should_interrupt: Optional[callable] = None,
     progress_callback: Optional[callable] = None,
 ) -> Dict[str, Any]:
-    """Execute exactly one queued PDF in an isolated temporary directory."""
+    """Execute exactly one queued PDF in an isolated temporary directory.
+
+    暂存目录里按「相对 documents/ 的原路径」镜像摆放文件，再把它当 documents_folder
+    传给 document_ingest_api：这样目录里只有一个 PDF，而 pipeline 推导出的 source
+    与原路径入库完全一致，逻辑ID/指纹在重试之间保持稳定。
+    """
     path = Path(file_path)
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"File not found: {file_path}")
+    source_rel = _document_source(path)
     with tempfile.TemporaryDirectory(prefix="single_ingest_") as tmp_dir:
-        staged_path = Path(tmp_dir) / f"{uuid.uuid4().hex[:8]}_{path.name}"
+        run_root = Path(tmp_dir)
+        # 扫描根与引导脚本分开放：根目录里只有这 PDF，脚本不会被当成文档
+        documents_folder = run_root / "documents"
+        script_path = run_root / "_ingest_bootstrap.py"
+        script_path.write_text(_INGEST_BOOTSTRAP, encoding="utf-8")
+        staged_path = documents_folder / source_rel
+        staged_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, staged_path)
+        # 子进程执行 PDF_ingest 暴露的函数式接口
         process = await asyncio.create_subprocess_exec(
-            *_build_ingestion_command(Path(tmp_dir), fast=fast),
+            *_build_ingestion_command(script_path, documents_folder, fast=fast),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -145,7 +234,7 @@ async def ingest_saved_pdf_file(
                     await process.wait()
                     raise IngestionInterrupted("Task was paused or deleted")
                 try:
-                    await asyncio.wait_for(process.wait(), timeout=0.5)
+                    await asyncio.wait_for(process.wait(), timeout=0.5)#防止子进程无限等待
                     break
                 except asyncio.TimeoutError:
                     continue
@@ -158,7 +247,13 @@ async def ingest_saved_pdf_file(
         stdout, stderr = "".join(stdout_lines), "".join(stderr_lines)
         if process.returncode != 0:
             raise RuntimeError((stderr or stdout or "Ingestion process failed").strip()[-2000:])
-        return {"returncode": process.returncode, "stdout": stdout, "stderr": stderr, "staged_file_name": staged_path.name}
+        return {
+            "returncode": process.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "document_source": source_rel,
+            **_parse_ingest_result(stdout_lines),
+        }
 
 
 class IngestionInterrupted(Exception):

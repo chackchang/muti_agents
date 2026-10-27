@@ -7,7 +7,7 @@ from typing import Any, Dict
 
 from openai import AsyncOpenAI
 
-from .db_utils import db_pool
+from agent.cache.db_utils import db_pool
 from .graph_localization_schema import (
     LOCALIZATION_SCHEMA_VERSION,
     graph_localization_hash,

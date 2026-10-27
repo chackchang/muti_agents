@@ -5,8 +5,8 @@ import re
 from typing import List
 
 from .agent_runtime import AgentDependencies
-from .langchain_tools import build_langchain_tools
-from .models import EvidenceSource
+from agent.tools.langchain_tools import build_langchain_tools
+from agent.model.models import EvidenceSource
 from common.title_aliases import TITLE_ALIASES, get_title_alias
 
 logger = logging.getLogger(__name__)

@@ -11,9 +11,9 @@ except ImportError:  # pragma: no cover - depends on installed LangChain major v
     _create_agent = None
 
 from .agent_runtime import AgentDependencies
-from .langchain_tools import build_langchain_tools
-from .models import EvidenceSource, ToolCall
-from .prompts import SYSTEM_PROMPT
+from agent.tools.langchain_tools import build_langchain_tools
+from agent.model.models import EvidenceSource, ToolCall
+from agent.orchestration.prompts.prompts import SYSTEM_PROMPT
 from .routing import has_unverified_web_citations, is_degenerate_answer
 
 logger = logging.getLogger(__name__)

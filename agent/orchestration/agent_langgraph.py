@@ -7,10 +7,10 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TypedD
 
 from langgraph.graph import END, START, StateGraph
 
-from .answer_review_runtime import review_generated_answer
+from agent.evidence.answer_review_runtime import review_generated_answer
 from .agent_langchain import get_langchain_chat_model
 from .agent_runtime import AgentDependencies
-from .evidence_citation_runtime import (
+from agent.evidence.evidence_citation_runtime import (
     build_evidence_references,
     format_evidence_references_for_prompt,
     review_answer_citations,
@@ -22,28 +22,28 @@ from .intent_planner import (
     plan_final_retrieval_debug,
     plan_user_intent_debug,
 )
-from .langchain_tools import build_langchain_tools
-from .models import EvidenceSource, ToolCall
+from agent.tools.langchain_tools import build_langchain_tools
+from agent.model.models import EvidenceSource, ToolCall
 from .planner_runtime import execute_intent_plan_steps, summarize_hits_for_planner
-from .graph_runtime import get_graph_neighbor_document_ids
-from .graph_relation_policy import select_graph_relations
-from .retrieval_harness_policy import (
+from agent.knowledge_graph.graph_runtime import get_graph_neighbor_document_ids
+from agent.knowledge_graph.graph_relation_policy import select_graph_relations
+from agent.retrieval.harness.retrieval_harness_policy import (
     compile_retrieval_contract,
     enforce_retrieval_contract,
     evaluate_retrieval_contract,
 )
-from .retrieval_harness_schema import RetrievalContract
-from .retrieval_failure_policy import (
+from agent.retrieval.harness.retrieval_harness_schema import RetrievalContract
+from agent.retrieval.retrieval_failure_policy import (
     apply_external_retrieval_failure_policy,
     build_external_retrieval_disclosure,
 )
-from .prompts import SYSTEM_PROMPT
-from .tools import DocumentListInput, is_general_web_search_enabled, list_documents_tool
-from .db_utils import list_document_sections
-from .section_catalog_policy import group_section_catalog, validate_catalog_section_steps
-from .evidence_selection_policy import select_final_evidence
-from .openalex_router import _is_openalex_enabled
-from .warning_text import clean_legacy_warning_text
+from agent.orchestration.prompts.prompts import SYSTEM_PROMPT
+from agent.retrieval.tools import DocumentListInput, is_general_web_search_enabled, list_documents_tool
+from agent.cache.db_utils import list_document_sections
+from agent.retrieval.section_catalog_policy import group_section_catalog, validate_catalog_section_steps
+from agent.evidence.evidence_selection_policy import select_final_evidence
+from agent.providers.openalex_router import _is_openalex_enabled
+from agent.infrastructure.warning_text import clean_legacy_warning_text
 
 
 class LangGraphAnalysisState(TypedDict, total=False):

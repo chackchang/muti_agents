@@ -5,7 +5,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.models.openai import OpenAIChatModel
 import openai
 from dotenv import load_dotenv
-from .embedding_runtime import get_embedding_client_for_route, get_embedding_route
+from utils.embedding.embedding_runtime import get_embedding_client_for_route, get_embedding_route
 
 load_dotenv()
 

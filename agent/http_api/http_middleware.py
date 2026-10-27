@@ -9,9 +9,9 @@ from typing import Optional, Tuple
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from .cache_utils import check_rate_limit
-from .request_context import reset_request_id, set_request_id
-from .runtime_metrics import begin_request_metrics, record_request_metrics
+from agent.cache.cache_utils import check_rate_limit
+from agent.infrastructure.request_context import reset_request_id, set_request_id
+from agent.infrastructure.runtime_metrics import begin_request_metrics, record_request_metrics
 
 
 logger = logging.getLogger(__name__)
