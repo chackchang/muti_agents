@@ -1081,28 +1081,28 @@ async def list_document_sections(document_ids: List[str]) -> List[Dict[str, Any]
 async def vector_search(
     embedding: List[float],
     limit: int = 10,
-    embedding_language: Optional[str] = None,
     document_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    执行向量相似度搜索。
-    
+    执行向量相似度搜索（pgvector 旧路径）。
+
+    注意：新入库只把向量写进 Qdrant，``chunks.embedding`` 为空；检索工具应使用
+    ``utils.db.db_utils`` 中的同名函数。
+
     Args:
         embedding: 查询对应的嵌入向量
         limit: 返回结果的最大数量
-    
+        document_ids: 只在这些文档内检索
+
     Returns:
         按相似度排序的匹配分块列表（最相关的在前）
     """
     async with db_pool.acquire() as conn:
         embedding_str = '[' + ','.join(map(str, embedding)) + ']'
         normalized_document_ids = list(dict.fromkeys(str(value).strip() for value in (document_ids or []) if str(value).strip()))
-        if embedding_language or normalized_document_ids:
+        if normalized_document_ids:
             conditions = ["c.embedding IS NOT NULL"]
             params: List[Any] = [embedding_str]
-            if embedding_language:
-                conditions.append(f"c.metadata->>'embedding_language' = ${len(params) + 1}")
-                params.append(embedding_language)
             if normalized_document_ids:
                 conditions.append(f"c.document_id = ANY(${len(params) + 1}::uuid[])")
                 params.append(normalized_document_ids)
@@ -1139,33 +1139,33 @@ async def hybrid_search(
     query_text: str,
     limit: int = 10,
     text_weight: float = 0.3,
-    embedding_language: Optional[str] = None,
     document_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    执行混合搜索（向量 + 关键词）。
-    
+    执行混合搜索（向量 + 关键词，pgvector 旧路径）。
+
+    注意：新入库只把向量写进 Qdrant，``chunks.embedding`` 为空；检索工具应使用
+    ``utils.db.db_utils`` 中的同名函数。
+
     Args:
         embedding: 查询对应的嵌入向量
         query_text: 用于关键词搜索的查询文本
         limit: 返回结果的最大数量
         text_weight: 文本相似度权重（0-1）
-    
+        document_ids: 只在这些文档内检索
+
     Returns:
         按综合分数排序的匹配分块列表（最相关的在前）
     """
     async with db_pool.acquire() as conn:
         embedding_str = '[' + ','.join(map(str, embedding)) + ']'
-        
+
         normalized_document_ids = list(dict.fromkeys(str(value).strip() for value in (document_ids or []) if str(value).strip()))
-        if embedding_language or normalized_document_ids:
+        if normalized_document_ids:
             safe_text_weight = max(0.0, min(float(text_weight), 1.0))
             vector_weight = 1.0 - safe_text_weight
             conditions = ["c.embedding IS NOT NULL"]
             params: List[Any] = [embedding_str, query_text]
-            if embedding_language:
-                conditions.append(f"c.metadata->>'embedding_language' = ${len(params) + 1}")
-                params.append(embedding_language)
             if normalized_document_ids:
                 conditions.append(f"c.document_id = ANY(${len(params) + 1}::uuid[])")
                 params.append(normalized_document_ids)
@@ -1361,10 +1361,11 @@ async def artifact_search(
     document_id: Optional[str] = None,
     document_ids: Optional[List[str]] = None,
     text_weight: float = 0.3,
-    embedding_language: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Search only artifact chunks (table/figure/algorithm) with vector + text relevance.
+
+    注意：新入库只把向量写进 Qdrant；检索工具应使用 ``utils.db.db_utils`` 中的同名函数。
     """
     async with db_pool.acquire() as conn:
         safe_limit = max(1, min(int(limit or 10), 50))
@@ -1399,11 +1400,6 @@ async def artifact_search(
                 conditions.append(f"d.id = ANY(${idx}::uuid[])")
                 params.append(normalized_document_ids)
                 idx += 1
-
-        if embedding_language:
-            conditions.append(f"COALESCE(c.metadata->>'embedding_language','') = ${idx}")
-            params.append(embedding_language)
-            idx += 1
 
         where_sql = " AND ".join(conditions)
         sql = f"""

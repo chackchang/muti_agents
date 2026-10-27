@@ -701,16 +701,6 @@ def _extract_target_ids(target_documents: List[Dict[str, Any]]) -> List[str]:
     return [str(d.get("document_id") or "").strip() for d in (target_documents or []) if str(d.get("document_id") or "").strip()]
 
 
-def _resolve_target_embedding_language(target_documents: List[Dict[str, Any]]) -> Optional[str]:
-    """Return a corpus route only when every selected target uses one known language."""
-    languages = {
-        str(document.get("document_language") or "").strip().lower()
-        for document in (target_documents or [])
-        if str(document.get("document_language") or "").strip().lower() in {"zh", "en"}
-    }
-    return next(iter(languages)) if len(languages) == 1 else None
-
-
 def _apply_scope_policy_to_hits(
     hits: List[Dict[str, Any]],
     scope_policy: str,
@@ -1329,9 +1319,6 @@ async def local_retrieval_node(state: LangGraphAnalysisState) -> LangGraphAnalys
             fallback_query=query,
             capabilities=capabilities,
             target_document_ids=target_document_ids,
-            target_embedding_language=_resolve_target_embedding_language(
-                list(next_state.get("target_documents") or [])
-            ),
             enforce_target_scope=(
                 str(next_state.get("scope_policy") or "") == "strict_target"
                 or bool(graph_expanded_document_ids)

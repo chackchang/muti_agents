@@ -193,7 +193,7 @@ async def handle_ingestion_message(payload: Dict[str, Any]) -> Dict[str, Any]:
             explicit_stages = {
                 "ingest_stage=vision": (32, "Analyzing figures with caption context"),
                 "ingest_stage=structure": (52, "Building sections, algorithms, and tables"),
-                "ingest_stage=embed": (68, "Generating language-routed embeddings"),
+                "ingest_stage=embed": (68, "Generating GE-M3 embeddings"),
                 "ingest_stage=persist": (85, "Persisting paper and artifact evidence"),
                 "ingest_stage=graph": (94, "Refreshing paper knowledge graph"),
             }
@@ -211,7 +211,7 @@ async def handle_ingestion_message(payload: Dict[str, Any]) -> Dict[str, Any]:
                 percent, stage = 10, "正在解析 PDF 版面与正文"
             elif "total chunks created" in text:
                 percent, stage = 45, "正在构建章节、算法、表格与图片证据"
-            elif "embedding batch" in text:
+            elif "generated embeddings for" in text:
                 percent, stage = 65, "正在生成检索向量"
             elif "saved document to postgresql" in text:
                 percent, stage = 92, "正在写入知识库与知识图谱"

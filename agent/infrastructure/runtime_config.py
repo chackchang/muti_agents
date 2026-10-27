@@ -125,7 +125,7 @@ def build_runtime_diagnostics() -> Dict[str, Any]:
         warnings.append(
             {
                 "code": "missing_openai_api_key",
-                "message": "OPENAI_API_KEY is empty; LLM and embedding requests will fail.",
+                "message": "OPENAI_API_KEY is empty; LLM requests will fail.",
             }
         )
     if not openai_base_url:

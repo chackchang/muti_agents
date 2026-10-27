@@ -119,7 +119,6 @@ async def execute_intent_plan_steps(
     warnings: Optional[List[str]] = None,
     capabilities: Optional[PlannerCapabilities] = None,
     target_document_ids: Optional[List[str]] = None,
-    target_embedding_language: Optional[str] = None,
     enforce_target_scope: bool = False,
 ) -> Dict[str, Any]:
     warnings = list(warnings or [])
@@ -143,9 +142,6 @@ async def execute_intent_plan_steps(
     normalized_target_ids = list(
         dict.fromkeys(str(value).strip() for value in (target_document_ids or []) if str(value).strip())
     )
-    normalized_target_language = str(target_embedding_language or "").strip().lower()
-    if normalized_target_language not in {"zh", "en"}:
-        normalized_target_language = ""
 
     for step in planned:
         tool_name, args = _step_to_tool_call(step)
@@ -171,8 +167,6 @@ async def execute_intent_plan_steps(
         }:
             if not args.get("document_id"):
                 args["document_ids"] = normalized_target_ids
-            if tool_name in {"hybrid_search", "vector_search", "artifact_search"} and normalized_target_language:
-                args["embedding_language"] = normalized_target_language
         dedupe_key = f"{tool_name}|{args.get('query','')}|{args.get('document_id','')}"
         if dedupe_key in seen:
             continue
