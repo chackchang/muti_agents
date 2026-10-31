@@ -19,7 +19,7 @@ GRAPH_MIN_SIMILARITY = 0.62
 async def _refresh_evidence_backed_relations(conn: Any) -> None:
     """Rebuild small, explicit paper-to-paper relations from persisted source text."""
     candidate_rows = await conn.fetch(
-        "SELECT d.id::text AS document_id, d.title, n.abbreviation FROM documents d JOIN paper_graph_nodes n ON n.document_id=d.id"
+        "SELECT d.id::text AS document_id, d.title, n.abbreviation FROM documents d JOIN paper_graph_nodes n ON n.document_id=d.id WHERE d.status='active'"
     )
     candidates = [GraphCandidate(document_id=str(row["document_id"]), title=str(row["title"]), abbreviation=str(row["abbreviation"] or "")) for row in candidate_rows]
     chunk_rows = await conn.fetch(
@@ -56,7 +56,7 @@ async def refresh_paper_graph(document_id: str) -> None:
     async with db_pool.acquire() as conn:
         async with conn.transaction():
             document = await conn.fetchrow(
-                "SELECT id::text, title, source, metadata FROM documents WHERE id=$1::uuid", document_id
+                "SELECT id::text, title, source, metadata FROM documents WHERE id=$1::uuid AND status='active'", document_id
             )
             if not document:
                 return
@@ -147,6 +147,7 @@ async def get_paper_graph() -> PaperGraphResponse:
                 ORDER BY updated_at DESC LIMIT 1
             ) l ON TRUE
             LEFT JOIN chunks c ON c.document_id=d.id
+            WHERE d.status='active'
             GROUP BY n.document_id,d.title,d.source,d.created_at,n.abbreviation,n.metadata,n.graph_version,n.updated_at,l.status,l.content
             ORDER BY d.created_at DESC
             """, LOCALIZATION_SCHEMA_VERSION,
@@ -169,7 +170,7 @@ async def ensure_paper_graph() -> None:
             SELECT d.id::text AS document_id
             FROM documents d
             LEFT JOIN paper_graph_nodes n ON n.document_id=d.id
-            WHERE n.document_id IS NULL
+            WHERE n.document_id IS NULL AND d.status='active'
             ORDER BY d.created_at
             """
         )

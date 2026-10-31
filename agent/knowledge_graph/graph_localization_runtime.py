@@ -36,7 +36,7 @@ async def _generate_localization(document_id: str, source_hash: str) -> None:
                 """
                 SELECT d.title, n.profile_text FROM documents d
                 JOIN paper_graph_nodes n ON n.document_id=d.id
-                WHERE d.id=$1::uuid
+                WHERE d.id=$1::uuid AND d.status='active'
                 """, document_id,
             )
         if not row:

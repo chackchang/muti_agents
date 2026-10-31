@@ -96,6 +96,10 @@ CREATE TABLE IF NOT EXISTS documents (
     fingerprint    text NOT NULL DEFAULT '',
     version        integer NOT NULL DEFAULT 1,
     is_current     boolean NOT NULL DEFAULT true,
+    -- 删除状态机：active（可检索）→ deleting（已请求删除，Qdrant 待清理）
+    -- → deleted（Qdrant 已清理，行待物理删除）。检索/列表/下载只认 active。
+    status         text NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'deleting', 'deleted')),
     title          text NOT NULL DEFAULT '',
     source         text NOT NULL DEFAULT '',
     content        text NOT NULL DEFAULT '',
@@ -112,6 +116,21 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS logical_id  text NOT NULL DEFAULT
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS fingerprint text NOT NULL DEFAULT '';
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS version     integer NOT NULL DEFAULT 1;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS is_current  boolean NOT NULL DEFAULT true;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS status      text NOT NULL DEFAULT 'active';
+
+-- 约束单独加：存量库的 status 列刚补上，需要与新建库保持一致的取值校验。
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'documents_status_check'
+    ) THEN
+        ALTER TABLE documents
+            ADD CONSTRAINT documents_status_check
+            CHECK (status IN ('active', 'deleting', 'deleted'));
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_documents_status ON documents (status);
 
 -- 存量行回填：逻辑ID取自 source，指纹取自 content（content 指纹与 Python 侧
 -- 配置指纹不同，首次重跑会走 update 替换，但不会重复入库）。

@@ -822,7 +822,7 @@ async def get_document(document_id: str) -> Optional[Dict[str, Any]]:
                 created_at,
                 updated_at
             FROM documents
-            WHERE id = $1::uuid
+            WHERE id = $1::uuid AND status = 'active'
             """,
             document_id
         )
@@ -844,7 +844,8 @@ async def get_document(document_id: str) -> Optional[Dict[str, Any]]:
 async def get_document_pdf(document_id: str) -> Optional[Dict[str, Any]]:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT pdf_blob, pdf_media_type FROM documents WHERE id = $1::uuid", document_id
+            "SELECT pdf_blob, pdf_media_type FROM documents WHERE id = $1::uuid AND status = 'active'",
+            document_id,
         )
         if not row or row["pdf_blob"] is None:
             return None
@@ -856,11 +857,96 @@ async def get_document_pdf_bytes(document_id: str) -> Optional[bytes]:
     return pdf["content"] if pdf else None
 
 
-async def delete_document(document_id: str) -> bool:
-    """Delete one paper and all dependent chunks, artifacts, translations and annotations."""
+# ---------------------------------------------------------------------------
+# 文档删除状态机：active -> deleting -> deleted -> 物理删除
+#
+# Qdrant 与 PostgreSQL 没有跨库事务，删除只能分阶段推进，每一步都幂等：
+# 1. active -> deleting：立即对检索/列表/下载隐藏；
+# 2. 按 document_id 删 Qdrant 向量（调用方确认成功）；
+# 3. deleting -> deleted：表示向量已清理；
+# 4. 物理删除 deleted 行（chunks/artifacts 等由外键级联）。
+# 任一步失败都停在当前状态，由后台清理任务继续推进。
+# ---------------------------------------------------------------------------
+
+async def get_document_status(document_id: str) -> Optional[str]:
     async with db_pool.acquire() as conn:
-        result = await conn.execute("DELETE FROM documents WHERE id = $1::uuid", document_id)
-        return result != "DELETE 0"
+        status = await conn.fetchval(
+            "SELECT status FROM documents WHERE id = $1::uuid", document_id
+        )
+    return str(status) if status else None
+
+
+async def begin_document_deletion(document_id: str) -> Optional[str]:
+    """把 active 文档置为 deleting，返回当前状态；文档不存在返回 None。
+
+    已经是 deleting/deleted 时原样返回，方便同一个删除请求重试。
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE documents
+            SET status = 'deleting', updated_at = CURRENT_TIMESTAMP
+            WHERE id = $1::uuid AND status = 'active'
+            RETURNING status
+            """,
+            document_id,
+        )
+        if row:
+            return str(row["status"])
+        row = await conn.fetchrow("SELECT status FROM documents WHERE id = $1::uuid", document_id)
+    return str(row["status"]) if row else None
+
+
+async def mark_document_deleted(document_id: str) -> bool:
+    """Qdrant 向量确认删除后，把文档从 deleting 置为 deleted。"""
+    async with db_pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE documents
+            SET status = 'deleted', updated_at = CURRENT_TIMESTAMP
+            WHERE id = $1::uuid AND status = 'deleting'
+            """,
+            document_id,
+        )
+    return result != "UPDATE 0"
+
+
+async def delete_document_row(document_id: str) -> bool:
+    """物理删除已标记 deleted 的文档；chunks/artifacts 等由外键级联清理。
+
+    只允许删除 deleted 行：deleting 说明 Qdrant 尚未清理完，不能先丢 PostgreSQL 记录。
+    """
+    async with db_pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM documents WHERE id = $1::uuid AND status = 'deleted'",
+            document_id,
+        )
+    return result != "DELETE 0"
+
+
+async def list_documents_by_status(status: str, limit: int = 100) -> List[Dict[str, Any]]:
+    """列出处于某个删除状态的文档，供后台清理任务使用（先到期的先处理）。"""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id::text, title, status, updated_at
+            FROM documents
+            WHERE status = $1
+            ORDER BY updated_at ASC
+            LIMIT $2
+            """,
+            status,
+            max(1, int(limit)),
+        )
+    return [
+        {
+            "id": row["id"],
+            "title": row["title"],
+            "status": row["status"],
+            "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+        }
+        for row in rows
+    ]
 
 
 async def get_document_translation(document_id: str, target_language: str, source_sha256: str) -> Optional[Dict[str, Any]]:
@@ -1002,8 +1088,9 @@ async def list_documents(
         """
         
         params = []
-        conditions = []
-        
+        # 删除中的文档（deleting/deleted）对外不可见：列表只展示 active。
+        conditions = ["d.status = 'active'"]
+
         if metadata_filter:
             conditions.append(f"d.metadata @> ${len(params) + 1}::jsonb")
             params.append(json.dumps(metadata_filter))
@@ -1056,6 +1143,7 @@ async def list_document_sections(document_ids: List[str]) -> List[Dict[str, Any]
             FROM chunks c
             JOIN documents d ON d.id = c.document_id
             WHERE c.document_id = ANY($1::uuid[])
+              AND d.status = 'active'
               AND COALESCE(c.metadata->>'section_path_text', c.metadata->>'section_title', '') <> ''
             GROUP BY c.document_id, d.title, COALESCE(c.metadata->>'section_path_text', c.metadata->>'section_title', ''),
                      COALESCE(c.metadata->>'section_title', '')
@@ -1101,7 +1189,7 @@ async def vector_search(
         embedding_str = '[' + ','.join(map(str, embedding)) + ']'
         normalized_document_ids = list(dict.fromkeys(str(value).strip() for value in (document_ids or []) if str(value).strip()))
         if normalized_document_ids:
-            conditions = ["c.embedding IS NOT NULL"]
+            conditions = ["c.embedding IS NOT NULL", "d.status = 'active'"]
             params: List[Any] = [embedding_str]
             if normalized_document_ids:
                 conditions.append(f"c.document_id = ANY(${len(params) + 1}::uuid[])")
@@ -1164,7 +1252,7 @@ async def hybrid_search(
         if normalized_document_ids:
             safe_text_weight = max(0.0, min(float(text_weight), 1.0))
             vector_weight = 1.0 - safe_text_weight
-            conditions = ["c.embedding IS NOT NULL"]
+            conditions = ["c.embedding IS NOT NULL", "d.status = 'active'"]
             params: List[Any] = [embedding_str, query_text]
             if normalized_document_ids:
                 conditions.append(f"c.document_id = ANY(${len(params) + 1}::uuid[])")
@@ -1228,6 +1316,9 @@ async def section_search(
         conditions: List[str] = []
         params: List[Any] = []
         idx = 1
+
+        # 删除中的文档不参与检索。
+        conditions.append("d.status = 'active'")
 
         # Prefer section-aware chunks for this tool.
         conditions.append(
@@ -1376,6 +1467,7 @@ async def artifact_search(
 
         conditions: List[str] = [
             "COALESCE(c.metadata->>'content_type', '') = 'artifact'",
+            "d.status = 'active'",
         ]
         params: List[Any] = [embedding_str, query_value]
         idx = 3

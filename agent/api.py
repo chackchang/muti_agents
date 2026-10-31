@@ -75,11 +75,14 @@ from agent.cache.db_utils import (
     get_artifact_image,
     get_document,
     get_document_pdf,
-    delete_document,
     list_document_annotations,
     create_document_annotation,
     update_document_annotation_position,
     delete_document_annotation,
+)
+from agent.cache.document_deletion import (
+    request_document_deletion,
+    run_document_cleanup_loop,
 )
 from agent.documents.pdf_page_renderer import render_cached_pdf_page_png
 from agent.documents.translation_error_policy import is_translation_service_unavailable
@@ -429,14 +432,29 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Startup failed: {e}")
         raise
-    yield
-    logger.info("Shutting down system...")
+
+    # 继续推进上次进程中断时遗留的删除任务（deleting/deleted）。
+    cleanup_stop = asyncio.Event()
+    cleanup_task = asyncio.create_task(run_document_cleanup_loop(cleanup_stop))
+    logger.info("Document deletion cleanup task started")
+
     try:
-        await close_redis_client()
-        await close_database()
-        logger.info("Connections closed")
-    except Exception as e:
-        logger.error(f"Shutdown error: {e}")
+        yield
+    finally:
+        logger.info("Shutting down system...")
+        cleanup_stop.set()
+        try:
+            await asyncio.wait_for(cleanup_task, timeout=5)
+        except asyncio.TimeoutError:
+            cleanup_task.cancel()
+        except Exception as e:
+            logger.error(f"Document cleanup task stop error: {e}")
+        try:
+            await close_redis_client()
+            await close_database()
+            logger.info("Connections closed")
+        except Exception as e:
+            logger.error(f"Shutdown error: {e}")
 
 
 app = FastAPI(
@@ -2395,9 +2413,15 @@ async def delete_document_annotation_endpoint(document_id: str, annotation_id: s
 
 @app.delete("/documents/{document_id}")
 async def delete_document_endpoint(document_id: str):
-    if not await delete_document(document_id):
+    """两阶段删除：先隐藏并清理向量，再由后台任务物理删除 PostgreSQL 行。
+
+    返回 status 表示当前阶段：``deleted`` 已完成（行可能由后台任务稍后物理删除），
+    ``deleting`` 表示 Qdrant 暂时不可用，已交给后台任务继续重试。
+    """
+    result = await request_document_deletion(document_id)
+    if result["status"] is None:
         raise HTTPException(status_code=404, detail="Document not found")
-    return {"status": "deleted", "document_id": document_id}
+    return {"status": result["status"], "document_id": document_id}
 
 
 @app.post("/documents/{document_id}/upgrade-full")

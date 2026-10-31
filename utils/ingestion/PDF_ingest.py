@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import asyncio
 from collections import Counter
 from datetime import datetime
@@ -186,13 +186,17 @@ class DocumentIngestionPipeline:
         return logical_id, fingerprint
 
     async def _find_current_document(self, logical_id: str) -> Optional[Dict[str, Any]]:
-        """按逻辑ID查当前版本（is_current 且版本号最大者）。"""
+        """按逻辑ID查当前版本（is_current、status=active 且版本号最大者）。
+
+        删除中的行（deleting/deleted）不算“已存在”：重新入库会创建新的 active 行，
+        旧墓碑由删除清理任务负责物理移除。
+        """
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT id::text, fingerprint, version, title
                 FROM documents
-                WHERE logical_id = $1 AND is_current = true
+                WHERE logical_id = $1 AND is_current = true AND status = 'active'
                 ORDER BY version DESC
                 LIMIT 1
                 """,
