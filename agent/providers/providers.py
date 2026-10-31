@@ -15,16 +15,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def get_llm_model(model_choice: Optional[str] = None) -> OpenAIChatModel:
-    llm_choice = model_choice or os.getenv("LLM_CHOICE", "gpt-4o-mini")
-    api_key = os.getenv("OPENAI_API_KEY")
-    base_url = os.getenv("OPENAI_BASE_URL")
+# def get_llm_model(model_choice: Optional[str] = None) -> OpenAIChatModel:
+#     llm_choice = model_choice or os.getenv("LLM_CHOICE", "gpt-4o-mini")
+#     api_key = os.getenv("OPENAI_API_KEY")
+#     base_url = os.getenv("OPENAI_BASE_URL")
 
-    provider = OpenAIProvider(
-        api_key=api_key,
-        base_url=base_url,
-    )
-    return OpenAIChatModel(llm_choice, provider=provider)
+#     provider = OpenAIProvider(
+#         api_key=api_key,
+#         base_url=base_url,
+#     )
+#     return OpenAIChatModel(llm_choice, provider=provider)
 
 
 async def test_llm_connection() -> tuple[bool, str | None]:

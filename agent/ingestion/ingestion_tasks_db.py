@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Sequence, get_args
@@ -15,7 +16,7 @@ ExpectedTaskStatus = IngestionTaskStatus | Sequence[IngestionTaskStatus]
 ALL_TASK_STATUSES: tuple[str, ...] = get_args(IngestionTaskStatus)
 
 _TASK_COLUMNS = """
-    task_id, document_id::text, file_path, filename, fast, status, queue_order,
+    task_id, document_id::text, file_path, filename, fast, payload, status, queue_order,
     progress_percent, progress_stage, error_message, retry_count, created_at,
     updated_at, started_at, finished_at
 """
@@ -23,12 +24,19 @@ _TASK_COLUMNS = """
 
 def _serialize_ingestion_task(row: Any) -> Dict[str, Any]:
     get = row.get if hasattr(row, "get") else row.__getitem__
+    raw_payload = get("payload")
+    if isinstance(raw_payload, str):
+        try:
+            raw_payload = json.loads(raw_payload)
+        except json.JSONDecodeError:
+            raw_payload = {}
     return {
         "task_id": get("task_id"),
         "document_id": get("document_id"),
         "file_path": get("file_path"),
         "filename": get("filename") or Path(str(get("file_path") or "")).name,
         "fast": bool(get("fast") or False),
+        "payload": dict(raw_payload) if isinstance(raw_payload, dict) else {},
         "status": get("status"),
         "queue_order": int(get("queue_order") or 0),
         "progress_percent": int(get("progress_percent") or 0),
@@ -52,22 +60,24 @@ async def create_ingestion_task(
     retry_count: int = 0,
     started_at: Optional[datetime] = None,
     finished_at: Optional[datetime] = None,
+    payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             f"""
             INSERT INTO ingestion_tasks (
-                task_id, document_id, file_path, filename, fast, status, queue_order,
+                task_id, document_id, file_path, filename, fast, payload, status, queue_order,
                 progress_percent, progress_stage, error_message, retry_count, started_at, finished_at
             )
             VALUES (
-                $1, $2::uuid, $3, $4, $5, $6,
+                $1, $2::uuid, $3, $4, $5, $6::jsonb, $7,
                 (SELECT COALESCE(MAX(queue_order), 0) + 1 FROM ingestion_tasks),
-                0, '等待入库', $7, $8, $9, $10
+                0, '等待入库', $8, $9, $10, $11
             )
             RETURNING {_TASK_COLUMNS}
             """,
-            task_id, document_id, file_path, Path(file_path).name, fast, status,
+            task_id, document_id, file_path, Path(file_path).name, fast,
+            json.dumps(payload or {}, ensure_ascii=False), status,
             error_message, retry_count, started_at, finished_at,
         )
         return _serialize_ingestion_task(row)

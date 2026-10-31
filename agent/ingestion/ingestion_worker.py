@@ -106,11 +106,18 @@ def parse_ingestion_message(body: bytes) -> Dict[str, Any]:
     if not task_id:
         raise ValueError("Missing required field: task_id")
 
+    raw_identity = payload.get("payload")
+    if raw_identity is None:
+        raw_identity = {}
+    if not isinstance(raw_identity, dict):
+        raise ValueError("payload must be a JSON object")
+
     return {
         "task_id": task_id,
         "file_path": file_path,
         "document_id": document_id,
         "fast": bool(payload.get("fast", False)),
+        "payload": raw_identity,
     }
 
 
@@ -127,6 +134,11 @@ async def handle_ingestion_message(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not current:
         logger.warning("Task not found, skip duplicated/orphan message: task_id=%s", task_id)
         return {"action": "skip_not_found", "task_id": task_id}
+
+    # 身份 payload 以任务表为准：消息可能是重投/旧副本，库里才是最新值。
+    task_payload = current.get("payload")
+    if not isinstance(task_payload, dict) or not task_payload:
+        task_payload = payload.get("payload") or {}
 
     current_status = str(current.get("status") or "")
     current_retry = int(current.get("retry_count") or 0)
@@ -225,6 +237,7 @@ async def handle_ingestion_message(payload: Dict[str, Any]) -> Dict[str, Any]:
         result = await ingest_saved_pdf_file(
             file_path,
             fast=bool(current.get("fast", payload.get("fast", False))),
+            payload=task_payload,
             should_interrupt=should_interrupt,
             progress_callback=report_progress,
         )
@@ -291,6 +304,7 @@ async def process_rabbitmq_message(body: bytes) -> Dict[str, Any]:
             document_id=(str(task.get("document_id") or "").strip() or None),
             file_path=str(task.get("file_path") or payload.get("file_path") or ""),
             fast=bool(payload.get("fast", False)),
+            payload=task.get("payload") or payload.get("payload") or {},
         )
         return result
     if action == "defer_until_turn":
@@ -301,6 +315,7 @@ async def process_rabbitmq_message(body: bytes) -> Dict[str, Any]:
             document_id=(str(task.get("document_id") or "").strip() or None),
             file_path=str(task.get("file_path") or payload.get("file_path") or ""),
             fast=bool(task.get("fast", payload.get("fast", False))),
+            payload=task.get("payload") or payload.get("payload") or {},
         )
         return result
     if action == "failed_max":
@@ -383,6 +398,7 @@ async def consume_ingestion_tasks() -> None:
             document_id=(str(task.get("document_id") or "").strip() or None),
             file_path=str(task["file_path"]),
             fast=bool(task.get("fast", False)),
+            payload=task.get("payload") or {},
         )
     if pending_tasks:
         logger.info("Requeued %s pending ingestion task(s) on worker startup", len(pending_tasks))

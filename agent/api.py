@@ -110,6 +110,7 @@ from agent.model.models import (
     ChatMessageItem,
     IngestionTaskResponse,
     OpenAlexIngestionRequest,
+    DocumentUpgradeRequest,
     UserMemoryProfilePayload,
     UserMemoryItemCreate,
     UserMemoryResponse,
@@ -836,12 +837,14 @@ async def prepare_chat_runtime(request: ChatRequest) -> ChatRuntime:
             "use_paper_graph": bool(request_metadata.get("use_paper_graph", True)),
         },
     )
+    
     context_payload = await _prepare_agent_prompt(
         session_id=request.session_id or "",
         user_id=request.user_id,
         user_message=request.message,
     )
     history_messages = list(context_payload.get("history_messages") or [])
+    #历史查询解析，解决指代不清问题
     history_resolution = resolve_history_query(
         latest_query=request.message,
         history_messages=history_messages,
@@ -851,6 +854,7 @@ async def prepare_chat_runtime(request: ChatRequest) -> ChatRuntime:
     except Exception:
         rewrite_model = None
     memory_state = context_payload.get("memory_state")
+    #查询内容重构
     rewrite_context = build_query_rewrite_context(
         history_messages=history_messages,
         memory_summary=dict(getattr(memory_state, "summary", {}) or {}),
@@ -862,6 +866,7 @@ async def prepare_chat_runtime(request: ChatRequest) -> ChatRuntime:
     user_rewrite_context = str(user_memory_context.get("query_rewrite") or "").strip()
     if user_rewrite_context:
         rewrite_context = "\n\n".join(item for item in (rewrite_context, user_rewrite_context) if item)
+    #查询关键词重写
     query_rewrite = await rewrite_query_with_conversation(
         original_query=request.message,
         conversation_context=rewrite_context,
@@ -876,13 +881,16 @@ async def prepare_chat_runtime(request: ChatRequest) -> ChatRuntime:
     ):
         retrieval_query = history_resolution.resolved_query
         effective_rewrite_reason = f"{query_rewrite.reason};history_resolver_fallback"
+    #对话策略分类
     dialog_policy = classify_dialog_turn(
         latest_query=request.message,
         history_messages=history_messages,
     )
+    #判断检索来源
     is_general_question = is_general_algorithm_question(request.message)
     may_need_general_web_search = needs_general_web_search(request.message)
     explicit_general_web_request = _is_explicit_general_web_request(request.message)
+    #判断是否为本地知识库问题
     is_local_question = is_local_kb_question(retrieval_query)
     simple_chat_decision = choose_simple_chat_strategy(
         message=request.message,
@@ -891,16 +899,17 @@ async def prepare_chat_runtime(request: ChatRequest) -> ChatRuntime:
         use_react=bool(request.use_react),
         use_web_search=effective_use_web_search,
     )
-
+    #本地知识库查询
     local_context = ""
     if is_local_question:
         local_context = await run_local_kb_preflight_if_needed(retrieval_query, deps)
     has_local_evidence = bool(local_context)
-
+    #输出格式要求
     format_instruction = build_format_instruction(
         has_local_evidence=has_local_evidence,
         is_general_question=is_general_question,
     )
+    #工具选择指导
     tool_choice_instruction = build_tool_choice_instruction(
         is_general_question=is_general_question,
         may_need_web=may_need_general_web_search,
@@ -1303,8 +1312,11 @@ async def chat(request: ChatRequest):
     try:
         session_id = await get_or_create_session(request)
         request.session_id = session_id
+        #准备运行时上下文
         runtime = await prepare_chat_runtime(request)
         requested_search_type = runtime.requested_search_type
+        
+        #执行代理
         (
             response,
             tools_used,
@@ -1314,6 +1326,7 @@ async def chat(request: ChatRequest):
             response_backend,
             workflow_metadata,
         ) = await execute_prepared_chat_runtime(
+           
             request.message,
             runtime,
         )
@@ -1469,6 +1482,7 @@ async def chat_stream(request: ChatRequest):
                 )
 
                 if runtime.simple_chat_decision.enabled:
+                    #如果是对话的形式
                     is_conversation = runtime.simple_chat_decision.mode == "conversation"
                     yield sse_event(
                         "status",
@@ -1554,10 +1568,11 @@ async def chat_stream(request: ChatRequest):
                                 ],
                             )
                         yield sse_event("sources", sources=sources_data)
+                        #入库
                         assistant_message_id = await add_message(
                             session_id=session_id,
                             role="assistant",
-                            content=full_response,
+                            content=full_response,#审核后的回答
                             metadata={
                                 "run_id": run_id,
                                 "streamed": True,
@@ -1574,6 +1589,7 @@ async def chat_stream(request: ChatRequest):
                                 **safe_workflow_metadata,
                             },
                         )
+                        #记忆
                         if user_message_id:
                             await set_message_memory_eligible(user_message_id)
                         await _persist_automatic_user_memory(
@@ -1655,22 +1671,26 @@ async def chat_stream(request: ChatRequest):
                     )
                     graph_start = asyncio.get_running_loop().time()
                     while not graph_task.done():
+                        #超时处理
                         if asyncio.get_running_loop().time() - graph_start >= LANGGRAPH_ANALYSIS_TIMEOUT_SECONDS:
                             graph_task.cancel()
                             yield sse_event("error", content="Deep analysis timed out. Please turn off deep analysis or narrow the question and retry.")
                             yield sse_event("end")
                             return
                         try:
+                            # 从进度队列获取消息,获取实时过程消息
                             msg = await asyncio.wait_for(progress_queue.get(), timeout=0.2)
                             if not msg:
                                 continue
                             if isinstance(msg, dict):
+                                #文字碎片，实时拼接
                                 if msg.get("type") == "answer_delta":
                                     delta = str(msg.get("content") or "")
                                     if delta:
                                         streamed_answer_parts.append(delta)
                                         yield sse_event("text", content=delta)
                                     continue
+                                #输出状态
                                 payload = {
                                     "content": str(msg.get("content") or ""),
                                     "phase": str(msg.get("phase") or "internal"),
@@ -1687,7 +1707,9 @@ async def chat_stream(request: ChatRequest):
                             yield sse_event("status", **payload)
                         except asyncio.TimeoutError:
                             continue
+                    #把任务兜里的最终返回值（Return Value）拿过来，赋值给 graph_result
                     graph_result = await graph_task
+                    # 残余消息处理
                     while not progress_queue.empty():
                         msg = await progress_queue.get()
                         if not msg:
@@ -1713,6 +1735,7 @@ async def chat_stream(request: ChatRequest):
                                 "level": "debug",
                             }
                         yield sse_event("status", **payload)
+                    # 处理最终响应
                     full_response = str(getattr(graph_result, "message", "") or "")
                     tools_used = list(getattr(graph_result, "tools_used", []) or [])
                     sources = list(getattr(graph_result, "sources", []) or [])
@@ -1724,31 +1747,40 @@ async def chat_stream(request: ChatRequest):
                         full_response,
                         drop_warning=bool(workflow_metadata.get("retrieval_skipped_by_planner") and workflow_metadata.get("direct_answer_allowed")),
                     )
+                    #最后的兜底，判断之前是否以及完整发送了内容
                     streamed_answer = "".join(streamed_answer_parts).strip()
+                    # 如果之前没有发送内容，直接发送最终内容
                     if full_response and not streamed_answer:
                         yield sse_event("text", content=full_response)
+                        #如果之前发送的内容和最终的内容有差异，补齐差异部分
                     elif full_response.startswith(streamed_answer) and len(full_response) > len(streamed_answer):
                         yield sse_event("text", content=full_response[len(streamed_answer):])
                     stream_backend = "langgraph"
                 else:
+                    #langchain流
                     yield sse_event("status", content="Relevant passages found. Generating answer...")
                     stream_start = asyncio.get_running_loop().time()
                     got_first_text = False
                     try:
+                        # 开始流
                         stream_iter = iter_langchain_agent_stream(full_prompt, deps=deps).__aiter__()
                         while True:
                             now = asyncio.get_running_loop().time()
+                            #到目前为止，还没跳出循环，已经过了多长时间
                             elapsed = now - stream_start
+                            #如果总体超时
                             if elapsed >= LLM_STREAM_TOTAL_TIMEOUT_SECONDS:
                                 llm_stream_total_timeout = True
                                 llm_generation_elapsed_seconds = round(elapsed, 3)
+                                #如果之前已经发送了内容，保持部分答案
                                 if full_response.strip():
                                     yield sse_event("status", content="Model generation is taking too long. Keeping the partial answer.")
                                     break
+                                #如果没有发送内容，直接返回错误
                                 yield sse_event("error", content="Model generation timed out with no valid answer. Retry later, switch search mode, or turn off deep analysis.")
                                 yield sse_event("end")
                                 return
-
+                            #计算下一个token的超时时间
                             timeout_seconds = LLM_FIRST_TOKEN_TIMEOUT_SECONDS if not got_first_text else min(
                                 60.0,
                                 max(1.0, LLM_STREAM_TOTAL_TIMEOUT_SECONDS - elapsed),
@@ -1758,13 +1790,16 @@ async def chat_stream(request: ChatRequest):
                             except StopAsyncIteration:
                                 llm_generation_elapsed_seconds = round(asyncio.get_running_loop().time() - stream_start, 3)
                                 break
+                            #下一个token超时
                             except asyncio.TimeoutError:
+                                #还没有收到第一个token
                                 if not got_first_text:
                                     llm_first_token_timeout = True
                                     llm_generation_elapsed_seconds = round(asyncio.get_running_loop().time() - stream_start, 3)
                                     yield sse_event("error", content="Model first-token timeout. Retry later, switch search mode, or turn off deep analysis.")
                                     yield sse_event("end")
                                     return
+                                #已经收到第一个token
                                 llm_stream_total_timeout = True
                                 llm_generation_elapsed_seconds = round(asyncio.get_running_loop().time() - stream_start, 3)
                                 if full_response.strip():
@@ -1773,7 +1808,7 @@ async def chat_stream(request: ChatRequest):
                                 yield sse_event("error", content="Model generation timed out with no valid answer. Retry later, switch search mode, or turn off deep analysis.")
                                 yield sse_event("end")
                                 return
-
+                            #正常过程
                             if event.get("type") == "text":
                                 chunk = str(event.get("content") or "")
                                 yield sse_event("text", content=chunk)
@@ -1783,10 +1818,12 @@ async def chat_stream(request: ChatRequest):
                             elif event.get("type") == "final":
                                 tools_used = list(event.get("tools_used", []) or [])
                                 sources = list(event.get("sources", []) or [])
+                                #检查前面内容是否为空，最终的保底
                                 if not full_response.strip():
                                     full_response = str(event.get("message") or "")
                     except Exception:
                         logger.exception("LangChain streaming iteration failed; falling back to non-stream mode.")
+                        #langchain非流模式
                         stream_result = await asyncio.wait_for(
                             stream_langchain_agent(full_prompt, deps=deps),
                             timeout=NON_STREAM_FALLBACK_TIMEOUT_SECONDS,
@@ -1799,6 +1836,7 @@ async def chat_stream(request: ChatRequest):
                         for chunk in chunk_list:
                             yield sse_event("text", content=chunk)
                             full_response += chunk
+                        #检查前面信息字符串是否为空
                         if not full_response.strip():
                             full_response = str(getattr(stream_result, "message", "") or "")
                         tools_used = list(getattr(stream_result, "tools_used", []) or [])
@@ -1855,12 +1893,14 @@ async def chat_stream(request: ChatRequest):
                     drop_warning=bool(workflow_metadata.get("retrieval_skipped_by_planner") and workflow_metadata.get("direct_answer_allowed")),
                 )
                 response_before_disclosure = full_response
+                #外部检索披露，根据workflow_metadata判断是否需要披露
                 full_response, external_retrieval_statuses, external_fallback_policy, external_disclosure = _apply_external_retrieval_disclosure(
                     full_response,
                     deps,
                     workflow_metadata,
                     allow_model_knowledge=not (is_local_question and not sources),
                 )
+                #之前回答的基础上，叠加外部检索披露的内容
                 if full_response.startswith(response_before_disclosure) and len(full_response) > len(response_before_disclosure):
                     yield sse_event("text", content=full_response[len(response_before_disclosure):])
                 review_result = review_generated_answer(
@@ -1868,6 +1908,7 @@ async def chat_stream(request: ChatRequest):
                     sources=sources,
                     is_local_question=is_local_question,
                 )
+                #respond入库前的审核
                 reviewed_response = review_result.revised_answer
                 if reviewed_response != full_response and reviewed_response.startswith(full_response):
                     appended_suffix = reviewed_response[len(full_response):]
@@ -1905,6 +1946,8 @@ async def chat_stream(request: ChatRequest):
                 safe_workflow_metadata["answer_review_risk"] = review_result.unsupported_claim_risk
                 safe_workflow_metadata["answer_review_reason"] = review_result.reason
                 safe_workflow_metadata["answer_review_note_count"] = len(review_result.unsupported_claim_notes or [])
+                
+                #工具调用
                 if tools_used:
                     tools_data = [
                         {
@@ -1922,7 +1965,7 @@ async def chat_stream(request: ChatRequest):
                     retrieval_harness=build_retrieval_harness_trace_payload(safe_workflow_metadata),
                 )
                 yield sse_event("sources", sources=sources_data)
-
+                #入库
                 if full_response.strip():
                     assistant_message_id = await add_message(
                         session_id=session_id,
@@ -1951,6 +1994,7 @@ async def chat_stream(request: ChatRequest):
                             **safe_workflow_metadata,
                         },
                     )
+                    #记忆
                     if user_message_id:
                         await set_message_memory_eligible(user_message_id)
                     if assistant_message_id:
@@ -1969,6 +2013,7 @@ async def chat_stream(request: ChatRequest):
                             workflow_metadata=safe_workflow_metadata,
                         )
                         await refresh_session_metadata(session_id)
+                #记录指标
                 _emit_chat_request_metric(
                     request_id=request_id,
                     session_id=session_id,
@@ -2356,7 +2401,10 @@ async def delete_document_endpoint(document_id: str):
 
 
 @app.post("/documents/{document_id}/upgrade-full")
-async def upgrade_document_to_full_endpoint(document_id: str):
+async def upgrade_document_to_full_endpoint(
+    document_id: str,
+    request: Optional[DocumentUpgradeRequest] = None,
+):
     """Supplement a fast ingestion with the complete evidence extraction pipeline."""
     from agent.config import IngestionConfig
     from utils.ingestion.PDF_ingest import document_upgrade_api
@@ -2365,8 +2413,35 @@ async def upgrade_document_to_full_endpoint(document_id: str):
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # 升级按「相对 documents_folder 的 source」重新推导逻辑ID，必须用入库时那套根目录，
-    # 否则会被判定为"未入库"。库里没存根目录，按常见位置依次找一遍。
+    # 逻辑ID来自 doi/title：请求体优先，其次用入库时保存的 identity_payload，
+    # 最后用文档表里的标题兜底。必须与首次入库时一致，否则会被判定为"未入库"。
+    metadata = document.get("metadata")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except json.JSONDecodeError:
+            metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    stored = metadata.get("identity_payload")
+    payload = dict(stored) if isinstance(stored, dict) else {}
+    if request and request.payload:
+        # 显式字段覆盖存量值；只补 title 时仍沿用入库时的 DOI，避免误判成另一篇。
+        payload.update(request.payload)
+    if not payload:
+        fallback_title = str(document.get("title") or "").strip()
+        if fallback_title:
+            payload["title"] = fallback_title
+        fallback_doi = str(metadata.get("doi") or "").strip()
+        if fallback_doi:
+            payload["doi"] = fallback_doi
+    if not payload:
+        raise HTTPException(
+            status_code=400,
+            detail="Upgrade requires a payload with doi or title; the document has no stored identity.",
+        )
+
+    # source 仍用来定位磁盘上的 PDF；逻辑ID不再依赖它。
     source = str(document.get("source") or "").strip()
     resolved: Optional[tuple[str, str]] = None
     for root in ("documents", "data", "."):
@@ -2386,6 +2461,7 @@ async def upgrade_document_to_full_endpoint(document_id: str):
                 include_images=True,
                 include_tables=True,
             ),
+            payload=payload,
         )
         return {"status": "succeeded", **result.model_dump()}
     except ValueError as exc:
@@ -2545,6 +2621,7 @@ async def _submit_openalex_ingestion(payload: OpenAlexIngestionRequest) -> Inges
         file_url=payload.pdf_url,
         title=payload.title,
         fast=payload.fast,
+        doi=payload.doi,
     )
     return IngestionTaskResponse(**task)
 
@@ -2587,6 +2664,7 @@ async def resume_ingestion_task(task_id: str):
             document_id=task.get("document_id"),
             file_path=task["file_path"],
             fast=bool(task.get("fast", False)),
+            payload=task.get("payload") or {},
         )
     except Exception as exc:
         # 只有任务还停在 resume 写入的 queued 时才回退；若已被 worker 接管就不覆盖

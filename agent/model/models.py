@@ -211,6 +211,8 @@ class IngestionTaskResponse(BaseModel):
     file_path: str
     filename: str = ""
     fast: bool = False
+    # 用户提供的身份信息 {doi?, title?}，worker 重试/重启恢复时据此重算逻辑ID。
+    payload: Dict[str, Any] = Field(default_factory=dict)
     status: str
     queue_order: int = 0
     progress_percent: int = 0
@@ -230,9 +232,10 @@ class OpenAlexIngestionRequest(BaseModel):
     pdf_url: Optional[str] = Field(default=None, min_length=1, max_length=4096)
     content_url: Optional[str] = Field(default=None, min_length=1, max_length=4096)
     openalex_id: Optional[str] = Field(default=None, max_length=512)
+    doi: Optional[str] = Field(default=None, max_length=512)
     fast: bool = False
 
-    @field_validator("title", "openalex_id", mode="before")
+    @field_validator("title", "openalex_id", "doi", mode="before")
     @classmethod
     def normalize_text(cls, value: Any) -> Any:
         if value is None:
@@ -259,6 +262,23 @@ class OpenAlexIngestionRequest(BaseModel):
         return self
 
 
+class DocumentUpgradeRequest(BaseModel):
+    """人工更新时显式提供的身份信息；缺省则使用文档入库时保存的 identity_payload。"""
+
+    payload: Optional[Dict[str, Any]] = None
+
+    @field_validator("payload", mode="before")
+    @classmethod
+    def normalize_payload(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise ValueError("payload must be an object with doi and/or title")
+        return {
+            key: str(value.get(key) or "").strip()
+            for key in ("doi", "title")
+            if str(value.get(key) or "").strip()
+        }
 
 
 class ErrorResponse(BaseModel):

@@ -127,15 +127,50 @@ class DocumentIngestionPipeline:
         await clear_vector_store()
         logger.info("Knowledge base reset complete; sessions/messages were preserved.")
 
-    def _compute_identity(self, pdf_bytes: bytes, document_source: str) -> tuple[str, str]:
-        """从 PDF 原文推导幂等标识。
+    @staticmethod
+    def normalize_identity_payload(payload: Optional[Dict[str, Any]]) -> tuple[str, str]:
+        """规范化用户传入的 doi/title，返回 (doi, title)。
 
-        逻辑ID只看 source（相对路径），内容修改后保持不变，用于定位“同一篇文档”。
+        DOI 大小写不敏感，并统一去掉常见 URL/前缀；标题只做空白折叠与大小写折叠。
+        """
+        raw = payload or {}
+        doi = str(raw.get("doi") or "").strip().lower()
+        for prefix in (
+            "https://doi.org/",
+            "http://doi.org/",
+            "https://dx.doi.org/",
+            "http://dx.doi.org/",
+            "doi:",
+        ):
+            if doi.startswith(prefix):
+                doi = doi[len(prefix):].strip()
+                break
+        title = " ".join(str(raw.get("title") or "").split()).casefold()
+        return doi, title
+
+    def _compute_identity(
+        self,
+        pdf_bytes: bytes,
+        payload: Optional[Dict[str, Any]],
+    ) -> tuple[str, str]:
+        """从用户传入的 doi/title 推导幂等标识。
+
+        逻辑ID只看规范化后的 DOI（优先）或标题（DOI 缺失时），与文件路径、
+        文件内容都无关：同一篇论文传到哪里都算同一篇；内容修改后逻辑ID不变。
         指纹用 PDF 原始字节（确定性）+ 会改变入库结果的配置：MinerU 抽取是非确定性的，
         同一 PDF 每次抽出的 markdown 都有细微差异（公式、标题格式），不能拿抽取后的
         content 当指纹，否则每次都会误判“内容已变”。
         """
-        logical_id = hashlib.sha256(document_source.strip().encode("utf-8")).hexdigest()[:16]
+        doi, title = self.normalize_identity_payload(payload)
+        if doi:
+            identity_key = f"doi:{doi}"
+        elif title:
+            identity_key = f"title:{title}"
+        else:
+            raise ValueError(
+                "Ingestion payload must include a doi or title to compute a stable logical ID"
+            )
+        logical_id = hashlib.sha256(identity_key.encode("utf-8")).hexdigest()[:16]
         config_signature = json.dumps(
             {
                 "include_images": self.include_images,
@@ -172,15 +207,23 @@ class DocumentIngestionPipeline:
             "title": row["title"],
         }
 
-    async def _ingest_single_document(self, file_path: str) -> IngestionResult:
-        """导入单个文档：先做逻辑ID/指纹幂等把关，再交给共用落库流程。"""
+    async def _ingest_single_document(
+        self,
+        file_path: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> IngestionResult:
+        """导入单个文档：先做逻辑ID/指纹幂等把关，再交给共用落库流程。
+
+        ``payload`` 由调用方（用户上传 / OpenAlex / 人工更新）提供，至少含 doi
+        或 title 之一，用于计算与文件路径无关的逻辑ID。
+        """
         start_time = datetime.now()
 
         # 指纹用 PDF 原始字节：MinerU 抽取非确定，抽取后的 content 不能当指纹
         pdf_bytes = Path(file_path).read_bytes()
         document_source = os.path.relpath(file_path, self.documents_folder)
         # 幂等把关：解析前先算逻辑ID + 指纹，查库决定 append / update / skip。
-        logical_id, fingerprint = self._compute_identity(pdf_bytes, document_source)
+        logical_id, fingerprint = self._compute_identity(pdf_bytes, payload)
         existing = await self._find_current_document(logical_id)
         if existing is not None and existing["fingerprint"] == fingerprint:
             # title 取自库中当前版本；兼容旧行 title 为空的情况
@@ -201,6 +244,7 @@ class DocumentIngestionPipeline:
             logical_id=logical_id,
             fingerprint=fingerprint,
             existing=existing,
+            payload=payload,
         )
 
     async def _extract_and_persist(
@@ -212,6 +256,7 @@ class DocumentIngestionPipeline:
         logical_id: str,
         fingerprint: str,
         existing: Optional[Dict[str, Any]],
+        payload: Optional[Dict[str, Any]] = None,
     ) -> IngestionResult:
         """抽取 → 归一化 → 分块 → 向量化 → 落库。
 
@@ -231,10 +276,12 @@ class DocumentIngestionPipeline:
         document = self.normalizer.normalize(
             raw_content, {**raw_metadata, "source": document_source}
         )
-        # title 为空时退回相对路径，保证文档表、chunk metadata 和导出 JSON 用同一个标题
-        document_title = str(document.get("title") or document_source).strip()
+        # 用户显式提供的标题优先；否则用抽取结果，仍为空则退回相对路径。
+        # 保证文档表、chunk metadata 和导出 JSON 用同一个标题。
+        payload_title = str((payload or {}).get("title") or "").strip()
+        document_title = payload_title or str(document.get("title") or document_source).strip()
         document["title"] = document_title
-        document["metadata"].setdefault("title", document_title)
+        document["metadata"]["title"] = document_title
 
         logger.info(
             "Document %s (logical_id=%s, mode=%s): %s",
@@ -300,6 +347,16 @@ class DocumentIngestionPipeline:
         )
         logger.info(f"Generated embeddings for {len(embedded_chunks)} chunks")
 
+        # 只存在文档级 metadata 里，分块已经生成完，不会复制进每个 chunk。
+        # 人工更新时据此还原当初计算逻辑ID的输入，保证能找回同一篇文档。
+        identity_payload = {
+            key: str((payload or {}).get(key) or "").strip()
+            for key in ("doi", "title")
+            if str((payload or {}).get(key) or "").strip()
+        }
+        if identity_payload:
+            document_metadata["identity_payload"] = identity_payload
+
         print("INGEST_STAGE=persist", flush=True)
         document_id = await self._save_to_postgres(
             document_title,
@@ -350,11 +407,15 @@ class DocumentIngestionPipeline:
             )
             return None
 
-    async def upgrade_document_to_full(self, file_path: str) -> IngestionResult:
+    async def upgrade_document_to_full(
+        self,
+        file_path: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> IngestionResult:
         """人工更新：用磁盘上的 PDF 重新抽取并覆盖同一篇已入库文档。
 
         与批量入库的 update 分支完全一致：
-        1. 逻辑ID由 ``source`` 推导，指纹由 PDF 字节 + 配置推导；
+        1. 逻辑ID由用户 payload（doi 优先、title 兜底）推导，指纹由 PDF 字节 + 配置推导；
         2. 文档未入库 → 拒绝（升级只针对已有文档）；
         3. 指纹一致 → ``skipped``，不碰任何库；
         4. 指纹变化 → 生成新版本，PostgreSQL + Qdrant 都成功后再删除旧版本。
@@ -366,16 +427,18 @@ class DocumentIngestionPipeline:
 
         pdf_bytes = Path(file_path).read_bytes()
         document_source = os.path.relpath(file_path, self.documents_folder)
-        logical_id, fingerprint = self._compute_identity(pdf_bytes, document_source)
+        logical_id, fingerprint = self._compute_identity(pdf_bytes, payload)
         existing = await self._find_current_document(logical_id)
         if existing is None:
             raise ValueError(
-                f"文档尚未入库，无法升级：source={document_source} "
+                f"文档尚未入库，无法升级：payload={payload or {}} "
                 f"(logical_id={logical_id})。请先通过 document_ingest_api 入库。"
             )
 
         if existing["fingerprint"] == fingerprint:
-            title = str(existing.get("title") or document_source).strip()
+            title = str(
+                existing.get("title") or (payload or {}).get("title") or document_source
+            ).strip()
             logger.info("Document unchanged (logical_id=%s), skip: %s", logical_id, title)
             return IngestionResult(
                 document_id=existing["id"],
@@ -392,6 +455,7 @@ class DocumentIngestionPipeline:
             logical_id=logical_id,
             fingerprint=fingerprint,
             existing=existing,
+            payload=payload,
         )
 
     async def _build_vision_chunks(
@@ -533,8 +597,53 @@ class DocumentIngestionPipeline:
             metadata["artifact_id"] = artifact_row["id"]
             chunk.metadata = metadata
 
-    async def ingest_documents(self, progress_callback: Optional[callable] = None) -> List[IngestionResult]:
-        """导入文档目录中的所有文档。"""
+    def _payloads_by_file(
+        self,
+        payload: Optional[Dict[str, Any]],
+        pdf_files: List[str],
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """把一次调用的 payload 解析成「文件路径 → payload」。
+
+        支持两种形态：
+        - 单个 ``{"doi": ..., "title": ...}``：只能用于单文件入库；
+        - 以相对 source（或文件名）为键的映射：用于批量入库、逐篇指定身份。
+        """
+        if not payload:
+            return {path: None for path in pdf_files}
+        if "doi" in payload or "title" in payload:
+            if len(pdf_files) > 1:
+                raise ValueError(
+                    "A single doi/title payload can only be used with one PDF; "
+                    "pass a mapping keyed by relative source or file name for batch ingestion."
+                )
+            return {pdf_files[0]: payload}
+
+        mapping: Dict[str, Optional[Dict[str, Any]]] = {}
+        missing: List[str] = []
+        for path in pdf_files:
+            source = os.path.relpath(path, self.documents_folder)
+            entry = (
+                payload.get(source)
+                or payload.get(Path(source).name)
+                or payload.get(Path(path).name)
+            )
+            if not isinstance(entry, dict):
+                missing.append(source)
+            mapping[path] = entry
+        if missing:
+            raise ValueError(f"Missing ingestion payload for: {', '.join(missing)}")
+        return mapping
+
+    async def ingest_documents(
+        self,
+        progress_callback: Optional[callable] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> List[IngestionResult]:
+        """导入文档目录中的所有文档。
+
+        ``payload`` 是逻辑ID的唯一来源（doi 优先、title 兜底）。单文件可传
+        ``{"doi": ..., "title": ...}``；批量导入需按 source/文件名逐篇指定。
+        """
         if not self._initialized:
             await self.initialize()
 
@@ -554,12 +663,13 @@ class DocumentIngestionPipeline:
             return []
 
         logger.info(f"Found {len(pdf_files)} PDF files to process")
+        payloads = self._payloads_by_file(payload, pdf_files)
 
         results = []
         for i, file_path in enumerate(pdf_files):
             try:
                 logger.info(f"Processing file {i + 1}/{len(pdf_files)}: {file_path}")
-                result = await self._ingest_single_document(file_path)
+                result = await self._ingest_single_document(file_path, payloads[file_path])
                 results.append(result)
 
                 if progress_callback:
@@ -808,6 +918,7 @@ class DocumentIngestionPipeline:
 async def document_upgrade_api(
     file_path: str,
     config: IngestionConfig | None = None,
+    payload: Optional[Dict[str, Any]] = None,
 ) -> IngestionResult:
     """人工更新接口：按 PDF 路径重新抽取并更新已入库的同一篇文档。
 
@@ -816,18 +927,22 @@ async def document_upgrade_api(
     - 指纹未变 → ``status="skipped"``，不做任何写操作；
     - 指纹变化 → 新版本写入 PostgreSQL + Qdrant 后删除旧版本，``status="updated"``。
 
-    ``file_path`` 需要位于 ``config.documents_folder`` 之下：逻辑ID由相对
-    source 推导，路径不在其中会推导出不同的 source，从而被判定为“未入库”。
+    ``payload`` 必须与首次入库时一致（doi/title），否则会推导出不同的逻辑ID，
+    从而被判定为“未入库”。默认调用方应传入文档 metadata 里保存的
+    ``identity_payload``。
     """
     pipeline = DocumentIngestionPipeline(config=config)
     await pipeline.initialize()
     try:
-        return await pipeline.upgrade_document_to_full(file_path)
+        return await pipeline.upgrade_document_to_full(file_path, payload=payload)
     finally:
         await pipeline.close()
 
 
-async def document_ingest_api(config: IngestionConfig):
+async def document_ingest_api(
+    config: IngestionConfig,
+    payload: Optional[Dict[str, Any]] = None,
+):
     '''学术文档pdf入库接口'''
     log_level = logging.DEBUG if config.verbose else logging.INFO
     logging.basicConfig(
@@ -847,7 +962,7 @@ async def document_ingest_api(config: IngestionConfig):
 
     try:
         start_time = datetime.now()
-        results = await pipeline.ingest_documents(progress_callback)
+        results = await pipeline.ingest_documents(progress_callback, payload=payload)
         end_time = datetime.now()
         total_time = (end_time - start_time).total_seconds()
 
@@ -903,7 +1018,24 @@ async def main():
         action="store_true",
         help="Fast text-only ingestion: disables image and table extraction",
     )
+    parser.add_argument(
+        "--payload-json",
+        default="",
+        help=(
+            "JSON file with {doi,title} for a single PDF, or a mapping keyed by "
+            "relative source / file name for batch ingestion. Required for identity."
+        ),
+    )
     args = parser.parse_args()
+
+    payload: Optional[Dict[str, Any]] = None
+    if args.payload_json:
+        with open(args.payload_json, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict):
+            raise ValueError("--payload-json must contain a JSON object")
+        if not payload:
+            raise ValueError("--payload-json is empty")
 
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
@@ -937,7 +1069,7 @@ async def main():
 
     try:
         start_time = datetime.now()
-        results = await pipeline.ingest_documents(progress_callback)
+        results = await pipeline.ingest_documents(progress_callback, payload=payload)
         end_time = datetime.now()
         total_time = (end_time - start_time).total_seconds()
 
