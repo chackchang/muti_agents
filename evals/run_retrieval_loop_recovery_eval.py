@@ -13,10 +13,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from agent.agent_langgraph import run_langgraph_analysis
-from agent.agent_runtime import AgentDependencies
-from agent.db_utils import close_database, initialize_database
-from agent.tools import HybridSearchInput, hybrid_search_tool
+from agent.orchestration.agent_langgraph import run_langgraph_analysis
+from agent.orchestration.agent_runtime import AgentDependencies
+from agent.cache.db_utils import close_database, initialize_database
+from agent.retrieval.tools import HybridSearchInput, hybrid_search_tool
 from common.encoding_utils import read_json_robust, write_json_utf8, write_text_utf8
 
 

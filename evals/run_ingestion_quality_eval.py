@@ -10,7 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from agent.db_utils import close_database, initialize_database
+from agent.cache.db_utils import close_database, initialize_database
 from common.encoding_utils import read_json_robust, write_json_utf8, write_text_utf8
 from evals.ingestion_eval_runtime import quality_report_to_markdown, run_ingestion_quality_suite
 

@@ -6,7 +6,7 @@ import os
 
 from openai import AsyncOpenAI
 
-from .cache_utils import cache_get_json, cache_set_json, make_cache_key
+from agent.cache.cache_utils import cache_get_json, cache_set_json, make_cache_key
 
 
 QUERY_TRANSLATION_CACHE_TTL_SECONDS = int(os.getenv("QUERY_TRANSLATION_CACHE_TTL_SECONDS", "604800"))

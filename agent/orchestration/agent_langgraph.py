@@ -7,43 +7,42 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TypedD
 
 from langgraph.graph import END, START, StateGraph
 
-from .answer_review_runtime import review_generated_answer
+from agent.evidence.answer_review_runtime import review_generated_answer
 from .agent_langchain import get_langchain_chat_model
 from .agent_runtime import AgentDependencies
-from .evidence_citation_runtime import (
+from agent.evidence.evidence_citation_runtime import (
     build_evidence_references,
     format_evidence_references_for_prompt,
     review_answer_citations,
 )
+from agent.model.intent_models import IntentPlan, PlannerCapabilities
 from .intent_planner import (
-    IntentPlan,
-    PlannerCapabilities,
     build_fallback_intent_plan,
     plan_final_retrieval_debug,
     plan_user_intent_debug,
 )
-from .langchain_tools import build_langchain_tools
-from .models import EvidenceSource, ToolCall
+from agent.tools.langchain_tools import build_langchain_tools
+from agent.model.models import EvidenceSource, ToolCall
 from .planner_runtime import execute_intent_plan_steps, summarize_hits_for_planner
-from .graph_runtime import get_graph_neighbor_document_ids
-from .graph_relation_policy import select_graph_relations
-from .retrieval_harness_policy import (
+from agent.knowledge_graph.graph_runtime import get_graph_neighbor_document_ids
+from agent.knowledge_graph.graph_relation_policy import select_graph_relations
+from agent.retrieval.harness.retrieval_harness_policy import (
     compile_retrieval_contract,
     enforce_retrieval_contract,
     evaluate_retrieval_contract,
 )
-from .retrieval_harness_schema import RetrievalContract
-from .retrieval_failure_policy import (
+from agent.retrieval.harness.retrieval_harness_schema import RetrievalContract
+from agent.retrieval.retrieval_failure_policy import (
     apply_external_retrieval_failure_policy,
     build_external_retrieval_disclosure,
 )
-from .prompts import SYSTEM_PROMPT
-from .tools import DocumentListInput, is_general_web_search_enabled, list_documents_tool
-from .db_utils import list_document_sections
-from .section_catalog_policy import group_section_catalog, validate_catalog_section_steps
-from .evidence_selection_policy import select_final_evidence
-from .openalex_router import _is_openalex_enabled
-from .warning_text import clean_legacy_warning_text
+from agent.orchestration.prompts.prompts import SYSTEM_PROMPT
+from agent.retrieval.tools import DocumentListInput, is_general_web_search_enabled, list_documents_tool
+from agent.cache.db_utils import list_document_sections
+from agent.retrieval.section_catalog_policy import group_section_catalog, validate_catalog_section_steps
+from agent.evidence.evidence_selection_policy import select_final_evidence
+from agent.providers.openalex_router import _is_openalex_enabled
+from agent.infrastructure.warning_text import clean_legacy_warning_text
 
 
 class LangGraphAnalysisState(TypedDict, total=False):
@@ -702,16 +701,6 @@ def _extract_target_ids(target_documents: List[Dict[str, Any]]) -> List[str]:
     return [str(d.get("document_id") or "").strip() for d in (target_documents or []) if str(d.get("document_id") or "").strip()]
 
 
-def _resolve_target_embedding_language(target_documents: List[Dict[str, Any]]) -> Optional[str]:
-    """Return a corpus route only when every selected target uses one known language."""
-    languages = {
-        str(document.get("document_language") or "").strip().lower()
-        for document in (target_documents or [])
-        if str(document.get("document_language") or "").strip().lower() in {"zh", "en"}
-    }
-    return next(iter(languages)) if len(languages) == 1 else None
-
-
 def _apply_scope_policy_to_hits(
     hits: List[Dict[str, Any]],
     scope_policy: str,
@@ -1330,9 +1319,6 @@ async def local_retrieval_node(state: LangGraphAnalysisState) -> LangGraphAnalys
             fallback_query=query,
             capabilities=capabilities,
             target_document_ids=target_document_ids,
-            target_embedding_language=_resolve_target_embedding_language(
-                list(next_state.get("target_documents") or [])
-            ),
             enforce_target_scope=(
                 str(next_state.get("scope_policy") or "") == "strict_target"
                 or bool(graph_expanded_document_ids)

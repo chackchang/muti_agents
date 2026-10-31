@@ -4,8 +4,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict
 
-from .app_config import get_ingestion_max_retries, get_ingestion_queue_name, get_rabbitmq_url
-from .db_utils import close_database, initialize_database
+from agent.infrastructure.app_config import get_ingestion_max_retries, get_ingestion_queue_name, get_rabbitmq_url
+from agent.cache.db_utils import close_database, initialize_database
 from .ingestion_jobs import IngestionInterrupted, ingest_saved_pdf_file
 from .ingestion_quota import is_quota_exhausted_error, quota_pause_message
 from .ingestion_tasks_db import get_ingestion_task, list_ingestion_tasks, update_ingestion_task_status
@@ -18,6 +18,15 @@ from .rabbitmq_producer import (
 
 logger = logging.getLogger(__name__)
 
+# worker 可以接管的起始状态：刚入队、上次尝试失败待重试、或进程崩溃后遗留的 processing。
+# paused / paused_quota / deleted / done 一律不接管——那是应用侧刚做出的决定。
+_CLAIMABLE_STATUSES = ("queued", "failed", "processing")
+
+# 还没被任何 worker 认领过的状态。认领之前的写入（目前只有「消息缺 file_path，放弃本次尝试」）
+# 只能用这个集合：显示 processing 的任务要么是别人正在跑（踩不得），要么是崩溃残留
+# （启动恢复会把它退回 queued），两种情况都不该由一条坏消息来改。
+_UNCLAIMED_STATUSES = ("queued", "failed")
+
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -28,6 +37,35 @@ def _short_error(exc: Exception, max_len: int = 500) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len]
+
+
+async def _finish_transition(
+    task_id: str,
+    previous: Dict[str, Any],
+    action: str,
+    *,
+    error_message: str | None = None,
+    **fields: Any,
+) -> Dict[str, Any]:
+    """写一次「worker 结束本次尝试」的状态跃迁，并带上 processing 前置条件。
+
+    只有任务仍在 processing 时才生效；如果应用侧已经把它暂停/删除/完成，这里不会覆盖，
+    也不再触发重投递或 DLQ —— 否则会出现「暂停后被 worker 改回 processing」这类互相踩踏。
+    """
+    updated = await update_ingestion_task_status(
+        task_id=task_id,
+        expected_status="processing",
+        error_message=error_message,
+        **fields,
+    )
+    if updated is None:
+        latest = await get_ingestion_task(task_id)
+        logger.warning(
+            "Task state changed concurrently, skip %s: task_id=%s status=%s",
+            action, task_id, str((latest or {}).get("status") or "missing"),
+        )
+        return {"action": "skip_conflict", "task": latest or previous, "error_message": error_message}
+    return {"action": action, "task": updated, "error_message": error_message}
 
 
 def _decode_raw_message(body: bytes, max_len: int = 2000) -> str:
@@ -68,11 +106,18 @@ def parse_ingestion_message(body: bytes) -> Dict[str, Any]:
     if not task_id:
         raise ValueError("Missing required field: task_id")
 
+    raw_identity = payload.get("payload")
+    if raw_identity is None:
+        raw_identity = {}
+    if not isinstance(raw_identity, dict):
+        raise ValueError("payload must be a JSON object")
+
     return {
         "task_id": task_id,
         "file_path": file_path,
         "document_id": document_id,
         "fast": bool(payload.get("fast", False)),
+        "payload": raw_identity,
     }
 
 
@@ -89,6 +134,11 @@ async def handle_ingestion_message(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not current:
         logger.warning("Task not found, skip duplicated/orphan message: task_id=%s", task_id)
         return {"action": "skip_not_found", "task_id": task_id}
+
+    # 身份 payload 以任务表为准：消息可能是重投/旧副本，库里才是最新值。
+    task_payload = current.get("payload")
+    if not isinstance(task_payload, dict) or not task_payload:
+        task_payload = payload.get("payload") or {}
 
     current_status = str(current.get("status") or "")
     current_retry = int(current.get("retry_count") or 0)
@@ -109,25 +159,22 @@ async def handle_ingestion_message(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not file_path:
         err = "Missing required field: file_path"
         new_retry = current_retry + 1
-        if new_retry < max_retries:
-            updated = await update_ingestion_task_status(
-                task_id=task_id,
-                status="queued",
-                error_message=err,
-                retry_count=new_retry,
-                finished_at=None,
-            )
-            return {"action": "retry", "task": updated or current, "error_message": err}
+        will_retry = new_retry < max_retries
         updated = await update_ingestion_task_status(
             task_id=task_id,
-            status="failed",
+            status="queued" if will_retry else "failed",
             error_message=err,
             retry_count=new_retry,
-            finished_at=_now_utc(),
+            finished_at=None if will_retry else _now_utc(),
+            expected_status=_UNCLAIMED_STATUSES,
         )
-        return {"action": "failed_max", "task": updated or current, "error_message": err}
+        if updated is None:
+            latest = await get_ingestion_task(task_id)
+            return {"action": "skip_conflict", "task": latest or current, "error_message": err}
+        return {"action": "retry" if will_retry else "failed_max", "task": updated, "error_message": err}
 
-    await update_ingestion_task_status(
+    # 抢占任务：只有任务仍处于可执行状态才继续，避免和 pause/delete 或重复投递撞车。
+    claimed = await update_ingestion_task_status(
         task_id=task_id,
         status="processing",
         error_message=None,
@@ -135,7 +182,15 @@ async def handle_ingestion_message(payload: Dict[str, Any]) -> Dict[str, Any]:
         finished_at=None,
         progress_percent=max(1, int(current.get("progress_percent") or 0)),
         progress_stage="正在准备论文文件",
+        expected_status=_CLAIMABLE_STATUSES,
     )
+    if claimed is None:
+        latest = await get_ingestion_task(task_id)
+        logger.info(
+            "Task is no longer runnable, skip before ingestion: task_id=%s status=%s",
+            task_id, str((latest or {}).get("status") or "missing"),
+        )
+        return {"action": "skip_conflict", "task": latest or current}
 
     try:
         last_progress = 1
@@ -150,14 +205,16 @@ async def handle_ingestion_message(payload: Dict[str, Any]) -> Dict[str, Any]:
             explicit_stages = {
                 "ingest_stage=vision": (32, "Analyzing figures with caption context"),
                 "ingest_stage=structure": (52, "Building sections, algorithms, and tables"),
-                "ingest_stage=embed": (68, "Generating language-routed embeddings"),
+                "ingest_stage=embed": (68, "Generating GE-M3 embeddings"),
                 "ingest_stage=persist": (85, "Persisting paper and artifact evidence"),
                 "ingest_stage=graph": (94, "Refreshing paper knowledge graph"),
             }
             for marker, value in explicit_stages.items():
                 if marker in text:
+                    # 进度只在任务仍为 processing 时写入：被暂停/删除后不能把状态顶回去
                     await update_ingestion_task_status(
-                        task_id=task_id, status="processing", progress_percent=max(last_progress, value[0]), progress_stage=value[1]
+                        task_id=task_id, status="processing", progress_percent=max(last_progress, value[0]),
+                        progress_stage=value[1], expected_status="processing",
                     )
                     last_progress = max(last_progress, value[0])
                     return
@@ -166,19 +223,21 @@ async def handle_ingestion_message(payload: Dict[str, Any]) -> Dict[str, Any]:
                 percent, stage = 10, "正在解析 PDF 版面与正文"
             elif "total chunks created" in text:
                 percent, stage = 45, "正在构建章节、算法、表格与图片证据"
-            elif "embedding batch" in text:
+            elif "generated embeddings for" in text:
                 percent, stage = 65, "正在生成检索向量"
             elif "saved document to postgresql" in text:
                 percent, stage = 92, "正在写入知识库与知识图谱"
             if percent > last_progress or stage != "正在处理论文":
                 last_progress = max(last_progress, percent)
                 await update_ingestion_task_status(
-                    task_id=task_id, status="processing", progress_percent=last_progress, progress_stage=stage
+                    task_id=task_id, status="processing", progress_percent=last_progress,
+                    progress_stage=stage, expected_status="processing",
                 )
 
         result = await ingest_saved_pdf_file(
             file_path,
             fast=bool(current.get("fast", payload.get("fast", False))),
+            payload=task_payload,
             should_interrupt=should_interrupt,
             progress_callback=report_progress,
         )
@@ -188,47 +247,50 @@ async def handle_ingestion_message(payload: Dict[str, Any]) -> Dict[str, Any]:
         final_document_id = str(result.get("document_id") or current_document_id or message_document_id or "").strip() or None
         if not final_document_id:
             raise RuntimeError("Ingestion finished without a persisted document ID")
-        updated = await update_ingestion_task_status(
-            task_id=task_id,
+        return await _finish_transition(
+            task_id,
+            current,
+            "done",
+            error_message=None,
             status="done",
             document_id=final_document_id,
-            error_message=None,
             finished_at=_now_utc(),
             progress_percent=100,
             progress_stage="入库完成",
         )
-        return {"action": "done", "task": updated or {"task_id": task_id, "status": "done"}}
     except IngestionInterrupted:
         latest = await get_ingestion_task(task_id)
         return {"action": "interrupted", "task": latest or current}
     except Exception as exc:
         err = _short_error(exc)
         if is_quota_exhausted_error(exc):
-            updated = await update_ingestion_task_status(
-                task_id=task_id,
-                status="paused_quota",
+            return await _finish_transition(
+                task_id,
+                current,
+                "paused_quota",
                 error_message=quota_pause_message(exc),
+                status="paused_quota",
                 finished_at=_now_utc(),
             )
-            return {"action": "paused_quota", "task": updated or current, "error_message": err}
         new_retry = current_retry + 1
         if new_retry < max_retries:
-            updated = await update_ingestion_task_status(
-                task_id=task_id,
-                status="queued",
+            return await _finish_transition(
+                task_id,
+                current,
+                "retry",
                 error_message=err,
+                status="queued",
                 retry_count=new_retry,
-                finished_at=None,
             )
-            return {"action": "retry", "task": updated or current, "error_message": err}
-        updated = await update_ingestion_task_status(
-            task_id=task_id,
-            status="failed",
+        return await _finish_transition(
+            task_id,
+            current,
+            "failed_max",
             error_message=err,
+            status="failed",
             retry_count=new_retry,
             finished_at=_now_utc(),
         )
-        return {"action": "failed_max", "task": updated or current, "error_message": err}
 
 
 async def process_rabbitmq_message(body: bytes) -> Dict[str, Any]:
@@ -242,6 +304,7 @@ async def process_rabbitmq_message(body: bytes) -> Dict[str, Any]:
             document_id=(str(task.get("document_id") or "").strip() or None),
             file_path=str(task.get("file_path") or payload.get("file_path") or ""),
             fast=bool(payload.get("fast", False)),
+            payload=task.get("payload") or payload.get("payload") or {},
         )
         return result
     if action == "defer_until_turn":
@@ -252,6 +315,7 @@ async def process_rabbitmq_message(body: bytes) -> Dict[str, Any]:
             document_id=(str(task.get("document_id") or "").strip() or None),
             file_path=str(task.get("file_path") or payload.get("file_path") or ""),
             fast=bool(task.get("fast", payload.get("fast", False))),
+            payload=task.get("payload") or payload.get("payload") or {},
         )
         return result
     if action == "failed_max":
@@ -313,14 +377,20 @@ async def consume_ingestion_tasks() -> None:
     tasks = await list_ingestion_tasks()
     for task in tasks:
         if task.get("status") == "processing" and not task.get("document_id"):
-            await update_ingestion_task_status(
+            # 列表是启动时读的，真正动手前再校验一次：期间可能已被暂停/删除/完成
+            reset = await update_ingestion_task_status(
                 task_id=str(task["task_id"]),
                 status="queued",
                 progress_percent=0,
                 progress_stage="Waiting to resume after worker restart",
                 error_message=None,
                 finished_at=None,
+                expected_status="processing",
             )
+            if reset is None:
+                logger.info(
+                    "Skip restart recovery, task state changed: task_id=%s", str(task["task_id"])
+                )
     pending_tasks = [task for task in await list_ingestion_tasks() if task.get("status") == "queued"]
     for task in pending_tasks:
         await publish_ingestion_task(
@@ -328,6 +398,7 @@ async def consume_ingestion_tasks() -> None:
             document_id=(str(task.get("document_id") or "").strip() or None),
             file_path=str(task["file_path"]),
             fast=bool(task.get("fast", False)),
+            payload=task.get("payload") or {},
         )
     if pending_tasks:
         logger.info("Requeued %s pending ingestion task(s) on worker startup", len(pending_tasks))

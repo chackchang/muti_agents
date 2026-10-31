@@ -5,11 +5,11 @@ from datetime import datetime
 from typing import Any, Dict
 
 from .app_config import get_rabbitmq_url
-from .cache_utils import get_redis_client, get_redis_runtime_status
-from .openalex_router import _is_openalex_enabled
-from .providers import test_llm_connection
-from .tools import get_general_web_search_provider, is_general_web_search_enabled
-from .db_utils import test_connection
+from agent.cache.cache_utils import get_redis_client, get_redis_runtime_status
+from agent.providers.openalex_router import _is_openalex_enabled
+from agent.providers.providers import test_llm_connection
+from agent.retrieval.tools import get_general_web_search_provider, is_general_web_search_enabled
+from agent.cache.db_utils import test_connection
 
 
 logger = logging.getLogger(__name__)

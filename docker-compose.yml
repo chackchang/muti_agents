@@ -1,11 +1,12 @@
-# 本地数据库编排：PostgreSQL（含 pgvector）+ Qdrant。
+# 本地基础设施编排：PostgreSQL（含 pgvector）+ Qdrant + RabbitMQ（异步摄取队列）。
 #
 # 前置：安装 Docker Desktop（Windows 用 WSL2 后端）。
 # 启动：  docker compose up -d
 # 停止：  docker compose down
 # 清空并重建（会丢数据）： docker compose down -v
 #
-# 连接参数与项目根目录 .env 保持一致（DB_HOST=localhost，端口 5432/6333）。
+# 连接参数与项目根目录 .env 保持一致（DB_HOST=localhost，端口 5432/6333/5672）。
+# RabbitMQ 管理界面：http://127.0.0.1:15672（账号见 .env 的 RABBITMQ_DEFAULT_USER/PASS）。
 
 services:
   postgres:
@@ -36,6 +37,27 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
 
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: agents-rabbitmq
+    restart: unless-stopped
+    environment:
+      # 不要用默认 guest：它只允许容器内 localhost 连接，宿主机转发过来会被拒绝
+      RABBITMQ_DEFAULT_USER: agents
+      RABBITMQ_DEFAULT_PASS: agents-pass-change-me
+    ports:
+      - "5672:5672"      # AMQP，worker / API 用
+      - "15672:15672"    # 管理界面（浏览器看队列）
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+
 volumes:
   postgres_data:
   qdrant_data:
+  rabbitmq_data:

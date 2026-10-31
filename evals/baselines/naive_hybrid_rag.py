@@ -2,8 +2,8 @@
 
 from typing import Any, Dict, List
 
-from agent.agent_langchain import get_langchain_chat_model
-from agent.tools import HybridSearchInput, hybrid_search_tool
+from agent.orchestration.agent_langchain import get_langchain_chat_model
+from agent.retrieval.tools import HybridSearchInput, hybrid_search_tool
 
 
 async def run_naive_hybrid_rag(question: str, top_k: int = 5) -> Dict[str, Any]:

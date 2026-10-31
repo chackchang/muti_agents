@@ -1,7 +1,7 @@
 import json
 from typing import Any, Dict, Optional
 
-from .app_config import get_ingestion_dlq_name, get_ingestion_queue_name, get_rabbitmq_url
+from agent.infrastructure.app_config import get_ingestion_dlq_name, get_ingestion_queue_name, get_rabbitmq_url
 
 
 def build_ingestion_task_message(
@@ -9,12 +9,16 @@ def build_ingestion_task_message(
     document_id: Optional[str],
     file_path: str,
     fast: bool = False,
+    payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return {
         "task_id": task_id,
         "document_id": document_id,
         "file_path": file_path,
         "fast": bool(fast),
+        # 身份信息同时落库，这里只是给 worker 的便捷副本；
+        # worker 以任务表里的 payload 为准，避免旧消息覆盖新值。
+        "payload": dict(payload or {}),
     }
 
 
@@ -23,6 +27,7 @@ async def publish_ingestion_task(
     document_id: Optional[str],
     file_path: str,
     fast: bool = False,
+    payload: Optional[Dict[str, Any]] = None,
 ) -> None:
     rabbitmq_url = get_rabbitmq_url()
     if not rabbitmq_url:
@@ -34,7 +39,9 @@ async def publish_ingestion_task(
         raise RuntimeError("aio-pika is not installed") from exc
 
     queue_name = get_ingestion_queue_name()
-    message_dict = build_ingestion_task_message(task_id, document_id, file_path, fast=fast)
+    message_dict = build_ingestion_task_message(
+        task_id, document_id, file_path, fast=fast, payload=payload
+    )
     message_body = json.dumps(message_dict, ensure_ascii=False).encode("utf-8")
 
     connection = await aio_pika.connect_robust(rabbitmq_url)

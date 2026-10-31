@@ -1,8 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .display_utils import clean_snippet_text, make_friendly_title
-from .models import EvidenceSource
+from agent.infrastructure.display_utils import clean_snippet_text, make_friendly_title
+from agent.model.models import EvidenceSource
 
 
 @dataclass

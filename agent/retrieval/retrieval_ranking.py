@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, List
 
-from .models import ChunkResult
+from agent.model.models import ChunkResult
 
 
 def merge_ranked_chunk_results(result_sets: List[List[ChunkResult]], limit: int) -> List[ChunkResult]:

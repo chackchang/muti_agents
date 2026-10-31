@@ -23,6 +23,9 @@ auth.json
 
 # PDF/视觉提取产物（MinerU/Docling 抽出的图片，可重新生成）
 documents/.vision_assets*/
+
+# 用户上传的待入库 PDF（运行时数据，不入库）
+documents/ui_uploads/
 # MinerU 运行时的临时渲染目录（%TEMP% 不可写时会退化到工作目录，中断会残留）
 mineru_parse_*/
 

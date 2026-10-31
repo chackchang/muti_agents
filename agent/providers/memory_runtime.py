@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from .memory_utils import RECENT_MESSAGE_COUNT, estimate_tokens, memory_eligible_messages, normalize_memory_state
+from agent.memory.memory_utils import RECENT_MESSAGE_COUNT, estimate_tokens, memory_eligible_messages, normalize_memory_state
 
 
 def build_session_memory_snapshot(*, session_id: str, memory_snapshot: Dict[str, Any], messages: List[Dict[str, Any]]) -> Dict[str, Any]:

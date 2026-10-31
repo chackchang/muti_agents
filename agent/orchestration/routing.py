@@ -5,8 +5,8 @@ import re
 from typing import List
 
 from .agent_runtime import AgentDependencies
-from .langchain_tools import build_langchain_tools
-from .models import EvidenceSource
+from agent.tools.langchain_tools import build_langchain_tools
+from agent.model.models import EvidenceSource
 from common.title_aliases import TITLE_ALIASES, get_title_alias
 
 logger = logging.getLogger(__name__)
@@ -14,7 +14,7 @@ LOCAL_PREFLIGHT_TIMEOUT_SECONDS = float(os.getenv("LOCAL_PREFLIGHT_TIMEOUT_SECON
 LOCAL_PREFLIGHT_QUERY_TIMEOUT_SECONDS = min(8.0, LOCAL_PREFLIGHT_TIMEOUT_SECONDS)
 
 
-def _is_general_algorithm_question(message: str) -> bool:
+def is_general_algorithm_question(message: str) -> bool:
     text = str(message or "").lower()
     has_algorithm = any(
         k in text for k in ["rrt", "rrt*", "a*", "dijkstra", "prm", "apf", "人工势场", "算法区别", "区别"]
@@ -26,8 +26,8 @@ def _is_general_algorithm_question(message: str) -> bool:
     return has_algorithm and not has_paper_intent
 
 
-def _is_local_kb_question(message: str) -> bool:
-    if _is_general_algorithm_question(message):
+def is_local_kb_question(message: str) -> bool:
+    if is_general_algorithm_question(message):
         return False
     text = str(message or "").lower()
     keywords = [
@@ -55,7 +55,7 @@ def _extract_known_local_paper_queries(message: str) -> List[str]:
     return queries
 
 
-def _may_need_general_web_search(message: str) -> bool:
+def needs_general_web_search(message: str) -> bool:
     text = str(message or "").lower()
     keywords = [
         "联网", "网上", "搜索", "查一下", "资料", "来源", "最新", "准确", "定义", "区别", "对比",
@@ -63,7 +63,7 @@ def _may_need_general_web_search(message: str) -> bool:
     return any(keyword in text for keyword in keywords)
 
 
-def _build_tool_choice_instruction(
+def build_tool_choice_instruction(
     is_general_question: bool,
     may_need_web: bool,
     has_local_evidence: bool,
@@ -168,8 +168,8 @@ def _clean_retrieval_snippet(text: str, max_len: int = 500) -> str:
     return value
 
 
-async def _run_local_kb_preflight_if_needed(message: str, deps: AgentDependencies) -> str:
-    if not _is_local_kb_question(message):
+async def run_local_kb_preflight_if_needed(message: str, deps: AgentDependencies) -> str:
+    if not is_local_kb_question(message):
         return ""
 
     async def _search_with_timeout(search_tool, query: str, limit: int) -> List[dict]:
@@ -302,7 +302,7 @@ async def _run_local_kb_preflight_if_needed(message: str, deps: AgentDependencie
         return ""
 
 
-def _dedupe_sources(sources: List[EvidenceSource]) -> List[EvidenceSource]:
+def dedupe_sources(sources: List[EvidenceSource]) -> List[EvidenceSource]:
     seen = set()
     unique: List[EvidenceSource] = []
     for source in list(sources or []):
@@ -320,7 +320,7 @@ def _dedupe_sources(sources: List[EvidenceSource]) -> List[EvidenceSource]:
     return unique
 
 
-def _build_format_instruction(has_local_evidence: bool, is_general_question: bool) -> str:
+def build_format_instruction(has_local_evidence: bool, is_general_question: bool) -> str:
     base = (
         "请使用清晰自然的中文回答。\n"
         "- 回答结构应围绕用户问题组织，不要固定套模板。\n"
