@@ -295,6 +295,10 @@ CREATE TABLE IF NOT EXISTS ingestion_tasks (
     -- 用户提供的身份信息（至少 doi 或 title 之一），逻辑ID据此计算，
     -- 同时供 worker 重试/重启恢复时还原，不能只放在 RabbitMQ 消息里。
     payload          jsonb NOT NULL DEFAULT '{}'::jsonb,
+    -- 队列消息发布标记：false = 这次 queued 可能还没有对应的 RabbitMQ 消息，
+    -- 需要（重新）发布；true = 已经成功发布过。worker 启动只补发 false 的任务，
+    -- 避免每次重启都把整个队列重复投递一遍。
+    publish_state    boolean NOT NULL DEFAULT false,
     status           text NOT NULL DEFAULT 'queued'
         CHECK (status IN ('queued', 'processing', 'paused', 'done', 'failed', 'paused_quota', 'deleted')),
     queue_order      integer NOT NULL DEFAULT 0,
@@ -312,6 +316,14 @@ CREATE TABLE IF NOT EXISTS ingestion_tasks (
 -- 迁移：为已存在的任务表补上身份 payload。
 ALTER TABLE ingestion_tasks
     ADD COLUMN IF NOT EXISTS payload jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+-- 迁移：补发标记。存量行默认 false，新 worker 启动时会补发一次（与旧行为一致），
+-- 之后新任务只在真正需要投递时才复位，重启不再重复发布。
+ALTER TABLE ingestion_tasks
+    ADD COLUMN IF NOT EXISTS publish_state boolean NOT NULL DEFAULT false;
+
+CREATE INDEX IF NOT EXISTS idx_ingestion_tasks_unpublished
+    ON ingestion_tasks (status, publish_state, queue_order);
 
 CREATE INDEX IF NOT EXISTS idx_ingestion_tasks_status_queue
     ON ingestion_tasks (status, queue_order, created_at);

@@ -92,6 +92,7 @@ from agent.ingestion.ingestion_tasks_db import (
     delete_ingestion_task,
     get_ingestion_task,
     list_ingestion_tasks,
+    mark_ingestion_task_published,
     pause_ingestion_task,
     reorder_ingestion_tasks,
     resume_ingestion_task as resume_ingestion_task_record,
@@ -2699,6 +2700,11 @@ async def resume_ingestion_task(task_id: str):
             expected_status="queued",
         )
         raise HTTPException(status_code=503, detail="Failed to requeue ingestion task") from exc
+    try:
+        await mark_ingestion_task_published(task_id)
+    except Exception as exc:
+        # 消息已投递；置位失败只会让 worker 启动时多补发一次（幂等跳过）。
+        logger.warning("Failed to mark resumed ingestion task published: task_id=%s error=%s", task_id, exc)
     return IngestionTaskResponse(**task)
 
 

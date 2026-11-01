@@ -8,7 +8,13 @@ from agent.infrastructure.app_config import get_ingestion_max_retries, get_inges
 from agent.cache.db_utils import close_database, initialize_database
 from .ingestion_jobs import IngestionInterrupted, ingest_saved_pdf_file
 from .ingestion_quota import is_quota_exhausted_error, quota_pause_message
-from .ingestion_tasks_db import get_ingestion_task, list_ingestion_tasks, update_ingestion_task_status
+from .ingestion_tasks_db import (
+    get_ingestion_task,
+    list_ingestion_tasks,
+    list_unpublished_queued_tasks,
+    mark_ingestion_task_published,
+    update_ingestion_task_status,
+)
 from .rabbitmq_producer import (
     build_ingestion_dlq_message,
     build_ingestion_invalid_message,
@@ -167,6 +173,8 @@ async def handle_ingestion_message(payload: Dict[str, Any]) -> Dict[str, Any]:
             retry_count=new_retry,
             finished_at=None if will_retry else _now_utc(),
             expected_status=_UNCLAIMED_STATUSES,
+            # 重试需要重新投递；先复位发布标记，崩溃时由启动补发兜底。
+            publish_state=False,
         )
         if updated is None:
             latest = await get_ingestion_task(task_id)
@@ -281,6 +289,8 @@ async def handle_ingestion_message(payload: Dict[str, Any]) -> Dict[str, Any]:
                 error_message=err,
                 status="queued",
                 retry_count=new_retry,
+                # 重试需要重新投递；先复位发布标记，崩溃时由启动补发兜底。
+                publish_state=False,
             )
         return await _finish_transition(
             task_id,
@@ -306,6 +316,9 @@ async def process_rabbitmq_message(body: bytes) -> Dict[str, Any]:
             fast=bool(payload.get("fast", False)),
             payload=task.get("payload") or payload.get("payload") or {},
         )
+        await mark_ingestion_task_published(
+            str(task.get("task_id") or payload.get("task_id") or "")
+        )
         return result
     if action == "defer_until_turn":
         task = result.get("task") or {}
@@ -316,6 +329,9 @@ async def process_rabbitmq_message(body: bytes) -> Dict[str, Any]:
             file_path=str(task.get("file_path") or payload.get("file_path") or ""),
             fast=bool(task.get("fast", payload.get("fast", False))),
             payload=task.get("payload") or payload.get("payload") or {},
+        )
+        await mark_ingestion_task_published(
+            str(task.get("task_id") or payload.get("task_id") or "")
         )
         return result
     if action == "failed_max":
@@ -378,6 +394,8 @@ async def consume_ingestion_tasks() -> None:
     for task in tasks:
         if task.get("status") == "processing" and not task.get("document_id"):
             # 列表是启动时读的，真正动手前再校验一次：期间可能已被暂停/删除/完成
+            # 注意不要复位 publish_state：processing 的消息没有 ack，RabbitMQ 会
+            # 自动重新投递；这里再发一份只会制造重复消息。
             reset = await update_ingestion_task_status(
                 task_id=str(task["task_id"]),
                 status="queued",
@@ -391,17 +409,21 @@ async def consume_ingestion_tasks() -> None:
                 logger.info(
                     "Skip restart recovery, task state changed: task_id=%s", str(task["task_id"])
                 )
-    pending_tasks = [task for task in await list_ingestion_tasks() if task.get("status") == "queued"]
+    # 只补发「还没确认发布过」的 queued 任务：已经发过的消息仍在 RabbitMQ 里，
+    # 重启时重新发布会让同一个任务出现多条消息。
+    pending_tasks = await list_unpublished_queued_tasks()
     for task in pending_tasks:
+        task_id = str(task["task_id"])
         await publish_ingestion_task(
-            task_id=str(task["task_id"]),
+            task_id=task_id,
             document_id=(str(task.get("document_id") or "").strip() or None),
             file_path=str(task["file_path"]),
             fast=bool(task.get("fast", False)),
             payload=task.get("payload") or {},
         )
+        await mark_ingestion_task_published(task_id)
     if pending_tasks:
-        logger.info("Requeued %s pending ingestion task(s) on worker startup", len(pending_tasks))
+        logger.info("Republished %s unpublished queued task(s) on worker startup", len(pending_tasks))
     connection = await aio_pika.connect_robust(rabbitmq_url)
     channel = await connection.channel()
     await channel.set_qos(prefetch_count=1)

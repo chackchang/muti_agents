@@ -99,6 +99,28 @@ async def list_ingestion_tasks(limit: int = 100) -> Sequence[Dict[str, Any]]:
         return [_serialize_ingestion_task(row) for row in rows]
 
 
+async def list_unpublished_queued_tasks(limit: int = 100) -> Sequence[Dict[str, Any]]:
+    """queued 且还没有确认发布过的任务——worker 启动时只需要补发这些。"""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT {_TASK_COLUMNS} FROM ingestion_tasks
+                WHERE status='queued' AND publish_state=false
+                ORDER BY queue_order, created_at LIMIT $1""",
+            max(1, min(limit, 500)),
+        )
+        return [_serialize_ingestion_task(row) for row in rows]
+
+
+async def mark_ingestion_task_published(task_id: str) -> None:
+    """发布成功后置位；发布失败或中途崩溃时保持 false，等下次补发。"""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE ingestion_tasks SET publish_state=true, updated_at=CURRENT_TIMESTAMP "
+            "WHERE task_id=$1",
+            task_id,
+        )
+
+
 async def get_next_queued_ingestion_task() -> Optional[Dict[str, Any]]:
     """Return the next runnable task according to the user-managed queue order."""
     async with db_pool.acquire() as conn:
@@ -142,6 +164,7 @@ async def update_ingestion_task_status(
     progress_stage: Optional[str] = None,
     *,
     expected_status: ExpectedTaskStatus,
+    publish_state: Optional[bool] = None,
 ) -> Optional[Dict[str, Any]]:
     """Update a task status as a guarded state transition.
 
@@ -163,13 +186,14 @@ async def update_ingestion_task_status(
                 error_message=$4, retry_count=COALESCE($5, retry_count),
                 started_at=COALESCE($6, started_at), finished_at=COALESCE($7, finished_at),
                 progress_percent=COALESCE($8, progress_percent),
-                progress_stage=COALESCE($9, progress_stage), updated_at=CURRENT_TIMESTAMP
+                progress_stage=COALESCE($9, progress_stage),
+                publish_state=COALESCE($11::boolean, publish_state), updated_at=CURRENT_TIMESTAMP
             WHERE task_id=$1 AND status = ANY($10::text[])
             RETURNING {_TASK_COLUMNS}
             """,
             task_id, status, document_id, error_message, retry_count, started_at, finished_at,
             max(0, min(100, progress_percent)) if progress_percent is not None else None, progress_stage,
-            expected,
+            expected, publish_state,
         )
         return _serialize_ingestion_task(row) if row else None
 
@@ -189,7 +213,8 @@ async def resume_ingestion_task(task_id: str) -> Optional[Dict[str, Any]]:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             f"""UPDATE ingestion_tasks SET status='queued', error_message=NULL, retry_count=0,
-                    progress_stage='等待入库', finished_at=NULL, updated_at=CURRENT_TIMESTAMP
+                    progress_stage='等待入库', finished_at=NULL, publish_state=false,
+                    updated_at=CURRENT_TIMESTAMP
                 WHERE task_id=$1 AND status IN ('paused', 'paused_quota') RETURNING {_TASK_COLUMNS}""",
             task_id,
         )

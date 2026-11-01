@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import json
+import logging
 import os
 import re
 import shutil
@@ -16,8 +17,14 @@ from urllib.request import Request, urlopen
 
 from fastapi import HTTPException
 
-from .ingestion_tasks_db import create_ingestion_task, update_ingestion_task_status
+from .ingestion_tasks_db import (
+    create_ingestion_task,
+    mark_ingestion_task_published,
+    update_ingestion_task_status,
+)
 from .rabbitmq_producer import publish_ingestion_task
+
+logger = logging.getLogger(__name__)
 
 DOCUMENT_UPLOAD_MAX_BYTES = int(os.getenv("DOCUMENT_UPLOAD_MAX_BYTES", str(30 * 1024 * 1024)))
 
@@ -158,6 +165,17 @@ async def _enqueue_file(
             status_code=503,
             detail={"message": "Failed to publish ingestion task to RabbitMQ", "task": updated, "error": str(exc)},
         ) from exc
+
+    try:
+        # 发布确认后再置位：中途崩溃时任务保持未发布，worker 启动会补发。
+        await mark_ingestion_task_published(task["task_id"])
+    except Exception as exc:
+        # 消息已经发出去了，置位失败只是多一次补发（幂等跳过），不影响本次入库。
+        logger.warning(
+            "Failed to mark ingestion task published, startup may republish: task_id=%s error=%s",
+            task["task_id"],
+            exc,
+        )
     return task
 
 
