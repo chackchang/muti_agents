@@ -58,6 +58,7 @@ async def request_document_deletion(document_id: str) -> Dict[str, Any]:
     status = await begin_document_deletion(document_id)
     if status is None:
         return {"document_id": document_id, "status": None, "deleted": False}
+    #如果row失败，说明此刻不是active，如果是deleted，说明之前已经被标记
     if status == "deleted":
         return {"document_id": document_id, "status": status, "deleted": True}
 
@@ -76,18 +77,51 @@ async def request_document_deletion(document_id: str) -> Dict[str, Any]:
             "deleted": False,
             "error": str(exc),
         }
+    # 删除向量成功，推进 PostgreSQL 状态到 deleted。
+    try:
+        transitioned = await mark_document_deleted(document_id)
+    except Exception as exc:
+        # SQL 没执行成功（连接中断、超时等）：文档仍是 deleting，检索已经隐藏，
+        # 后台清扫会在下一轮重新走一遍「删向量 -> 标记 deleted」。
+        logger.warning(
+            "Failed to mark document deleted, keeping status=deleting: document_id=%s error=%s",
+            document_id,
+            exc,
+        )
+        return {
+            "document_id": document_id,
+            "status": "deleting",
+            "deleted": False,
+            "error": str(exc),
+        }
 
-    if not await mark_document_deleted(document_id):
-        # 行可能已被并发清理，或状态被其他请求改动；以库里实际状态为准。
+    if not transitioned:
+        # 标记失败，说明 UPDATE 执行时对方状态不在 deleting。
+        # 重新查询document状态，此刻状态可能是任何情况，因为不在同一时刻操作
         latest = await get_document_status(document_id)
+        #document已经被并发清理，直接返回deleted状态
         if latest is None:
             return {"document_id": document_id, "status": "deleted", "deleted": True}
+        #document已经被其他请求改动
+        if latest == "deleted":
+            logger.info("Document has been deleted by other request: document_id=%s", document_id)
+            return {"document_id": document_id, "status": latest, "deleted": True}
+        if latest == "deleting":
+            logger.info("Document is still in deleting state, will retry later: document_id=%s", document_id)
+            return {"document_id": document_id, "status": latest, "deleted": False}
+        # 状态被并发改回了 active（或出现预期外的值）。此时向量已经删了，
+        # 如果就这样把 active 返回给调用方，文档会停留在“可见但检索不到”的半坏状态，
+        # 后台清扫也只处理 deleting/deleted，永远不会再修它。
+        # 所以按用户的删除意图重新标记 deleting，交给清扫任务收尾。
         logger.warning(
-            "Qdrant vectors deleted but status transition failed: document_id=%s status=%s",
-            document_id,
+            "Document status changed to %s after vectors were deleted; re-marking deleting: document_id=%s",
             latest,
+            document_id,
         )
-        return {"document_id": document_id, "status": latest, "deleted": False}
+        remark = await begin_document_deletion(document_id)
+        if remark is None or remark == "deleted":
+            return {"document_id": document_id, "status": "deleted", "deleted": True}
+        return {"document_id": document_id, "status": remark, "deleted": False}
 
     logger.info("Document deletion confirmed: document_id=%s", document_id)
     return {"document_id": document_id, "status": "deleted", "deleted": True}
@@ -110,7 +144,18 @@ async def cleanup_pending_document_deletions(limit: int = _CLEANUP_BATCH_SIZE) -
             )
             stats["failed"] += 1
             continue
-        if await mark_document_deleted(document_id):
+        try:
+            transitioned = await mark_document_deleted(document_id)
+        except Exception as exc:
+            # 单条 SQL 失败不能中断整轮清扫，否则同一批里的其他文档也处理不了。
+            logger.warning(
+                "Cleanup sweep: failed to mark document deleted, retrying next round: document_id=%s error=%s",
+                document_id,
+                exc,
+            )
+            stats["failed"] += 1
+            continue
+        if transitioned:
             stats["confirmed"] += 1
         else:
             # 行可能在两次查询之间被并发请求推进到 deleted，或已不存在。
