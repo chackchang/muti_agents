@@ -21,6 +21,9 @@ wheels/
 debug*.html
 auth.json
 
+# 接口手动测试输出（curl 响应、请求头等，可重新生成）
+out/
+
 # PDF/视觉提取产物（MinerU/Docling 抽出的图片，可重新生成）
 documents/.vision_assets*/
 
