@@ -7,8 +7,8 @@ from time import perf_counter
 from typing import Any, Dict, List, Sequence
 import random
 
-from agent.db_utils import close_database, db_pool, initialize_database
-from agent.models import IngestionConfig
+from agent.cache.db_utils import close_database, db_pool, initialize_database
+from agent.config import IngestionConfig
 from common.encoding_utils import write_json_utf8, write_text_utf8
 
 
@@ -339,7 +339,7 @@ async def run_sample_ingestion_evaluation(
     chunk_overlap: int = 150,
     fast: bool = False,
 ) -> Dict[str, Any]:
-    from ingestion.ingest import DocumentIngestionPipeline
+    from utils.ingestion.PDF_ingest import DocumentIngestionPipeline
 
     selected_files = select_pdf_files(pdf_dir=pdf_dir, sample_size=sample_size, sample_mode=sample_mode, seed=seed)
     run_label = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -347,16 +347,13 @@ async def run_sample_ingestion_evaluation(
     staged_files = stage_pdf_files(selected_files=selected_files, source_root=pdf_dir, stage_root=stage_dir)
 
     config = IngestionConfig(
+        documents_folder=str(stage_dir),
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-        use_semantic_chunking=not fast,
-    )
-    pipeline = DocumentIngestionPipeline(
-        config=config,
-        documents_folder=str(stage_dir),
         include_images=not fast,
         include_tables=not fast,
     )
+    pipeline = DocumentIngestionPipeline(config=config)
 
     started_at = datetime.now(timezone.utc).isoformat()
     wall_start = perf_counter()

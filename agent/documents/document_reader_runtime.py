@@ -8,7 +8,7 @@ from typing import Any, AsyncIterator, Dict, List
 
 from openai import AsyncOpenAI
 
-from .db_utils import get_document, get_document_translation, save_document_translation
+from agent.cache.db_utils import get_document, get_document_translation, save_document_translation
 
 
 def document_source_hash(markdown: str) -> str:

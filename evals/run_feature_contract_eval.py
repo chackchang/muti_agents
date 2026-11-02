@@ -2,8 +2,8 @@
 from __future__ import annotations
 import argparse, asyncio, json, time
 from pathlib import Path
-from agent.db_utils import close_database, initialize_database, db_pool
-from agent.selection_translation_runtime import translate_selection
+from agent.cache.db_utils import close_database, initialize_database, db_pool
+from agent.documents.selection_translation_runtime import translate_selection
 from common.encoding_utils import write_json_utf8, write_text_utf8
 
 async def main() -> None:

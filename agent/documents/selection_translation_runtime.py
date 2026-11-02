@@ -8,7 +8,7 @@ from typing import Any, Dict
 
 from openai import AsyncOpenAI
 
-from .db_utils import (
+from agent.cache.db_utils import (
     get_document,
     get_selection_translation,
     get_translation_profile,

@@ -1,8 +1,8 @@
 from typing import Any, Dict, List, Optional
 
-from .agent_runtime import AgentDependencies, _collect_evidence_hit
-from .external_retrieval_resilience import parse_external_retrieval_status
-from .tools import (
+from agent.orchestration.agent_runtime import AgentDependencies, _collect_evidence_hit
+from agent.retrieval.external_retrieval_resilience import parse_external_retrieval_status
+from agent.retrieval.tools import (
     ArtifactSearchInput,
     DocumentInput,
     DocumentListInput,
@@ -65,14 +65,12 @@ async def run_vector_search_payload(
     query: str,
     limit: int,
     document_ids: Optional[List[str]] = None,
-    embedding_language: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     try:
         results = await vector_search_tool(VectorSearchInput(
             query=query,
             limit=limit,
             document_ids=document_ids,
-            embedding_language=embedding_language,
         ))
         payload = [chunk_result_to_payload(r) for r in results]
         collect_hits(deps, payload)
@@ -88,7 +86,6 @@ async def run_hybrid_search_payload(
     limit: int,
     text_weight: float = 0.3,
     document_ids: Optional[List[str]] = None,
-    embedding_language: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     try:
         results = await hybrid_search_tool(
@@ -97,7 +94,6 @@ async def run_hybrid_search_payload(
                 limit=limit,
                 text_weight=text_weight,
                 document_ids=document_ids,
-                embedding_language=embedding_language,
             )
         )
         payload = [chunk_result_to_payload(r) for r in results]
@@ -233,7 +229,6 @@ async def run_artifact_search_payload(
     document_id: Optional[str] = None,
     document_ids: Optional[List[str]] = None,
     text_weight: float = 0.3,
-    embedding_language: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     try:
         results = await artifact_search_tool(
@@ -244,7 +239,6 @@ async def run_artifact_search_payload(
                 document_id=document_id,
                 document_ids=document_ids,
                 text_weight=text_weight,
-                embedding_language=embedding_language,
             )
         )
         payload = [chunk_result_to_payload(r) for r in results]

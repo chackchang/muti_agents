@@ -10,9 +10,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from agent.agent_langgraph import run_langgraph_analysis
-from agent.agent_runtime import AgentDependencies
-from agent.db_utils import db_pool
+from agent.orchestration.agent_langgraph import run_langgraph_analysis
+from agent.orchestration.agent_runtime import AgentDependencies
+from agent.cache.db_utils import db_pool
 from common.encoding_utils import write_json_utf8, write_text_utf8
 
 

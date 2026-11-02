@@ -12,21 +12,20 @@ from urllib.request import Request, urlopen
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-from .db_utils import (
-    vector_search,
-    hybrid_search,
-    section_search,
-    artifact_search,
+# 文档/分块正文与章节检索以 PostgreSQL 为准（沿用 agent 自己的连接池）；
+# 向量检索必须走 Qdrant——入库把 dense/sparse 写在那里，pgvector 的
+# chunks.embedding 不再有新数据。
+from agent.cache.db_utils import (
     get_document,
     list_documents,
     get_document_chunks,
+    section_search,
 )
-from .models import ChunkResult, DocumentMetadata
+from agent.model.models import ChunkResult, DocumentMetadata
 from .retrieval_ranking import merge_ranked_chunk_results
-from .providers import build_embedding_request_kwargs, get_embedding_client, get_embedding_model
-from .embedding_runtime import EmbeddingLanguage, get_embedding_client_for_route, get_embedding_route
-from .cache_utils import cache_get_json, cache_set_json, make_cache_key
-from .query_translation_runtime import translate_query_to_english
+from utils import EmbeddingVector, aembed_texts, get_embedding_backend_name, get_embedding_model_name
+from utils.db.db_utils import vector_search, hybrid_search, artifact_search
+from agent.cache.cache_utils import cache_get_json, cache_set_json, make_cache_key
 from .external_retrieval_resilience import (
     not_configured_external_retrieval,
     run_external_retrieval,
@@ -35,9 +34,6 @@ from .external_retrieval_resilience import (
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-embedding_client = get_embedding_client()
-EMBEDDING_MODEL = get_embedding_model()
-EMBEDDING_TIMEOUT_SECONDS = float(os.getenv("EMBEDDING_TIMEOUT_SECONDS", "20"))
 LOCAL_SEARCH_TIMEOUT_SECONDS = float(os.getenv("LOCAL_SEARCH_TIMEOUT_SECONDS", "30"))
 EMBEDDING_CACHE_TTL_SECONDS = int(os.getenv("EMBEDDING_CACHE_TTL_SECONDS", "86400"))
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
@@ -49,78 +45,46 @@ DEFAULT_GENERAL_WEB_ENDPOINTS = {
 }
 
 
-async def generate_embedding(text: str) -> List[float]:
+async def embed_query(text: str) -> EmbeddingVector:
+    """把查询编码成 ``(dense, sparse)``，与入库使用同一个运行时。
+
+    查询和入库现在共用 ``utils`` 暴露的 GE-M3：同一个模型、同一套维度与
+    稀疏词表，所以不存在“这段查询该走中文模型还是英文模型”的问题，也
+    不需要再为中文查询额外补一条英文检索路线。
+    """
+    query = str(text or "")
     use_cache = _as_bool_env("ENABLE_REDIS_CACHE", True)
     cache_key = None
     if use_cache:
-        query_hash = hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
-        cache_key = make_cache_key("embedding", EMBEDDING_MODEL, query_hash)
+        query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+        cache_key = make_cache_key(
+            "embedding",
+            get_embedding_backend_name(),
+            get_embedding_model_name(),
+            query_hash,
+        )
         cached = await cache_get_json(cache_key)
-        if isinstance(cached, list) and cached:
-            return cached
+        if isinstance(cached, dict) and isinstance(cached.get("dense"), list):
+            sparse = {
+                int(index): float(weight)
+                for index, weight in (cached.get("sparse") or {}).items()
+            }
+            return list(cached["dense"]), sparse
 
     try:
-        response = await asyncio.wait_for(
-            embedding_client.embeddings.create(
-                **build_embedding_request_kwargs(
-                    model=EMBEDDING_MODEL,
-                    input_value=text,
-                    encoding_format="float",
-                )
-            ),
-            timeout=EMBEDDING_TIMEOUT_SECONDS,
-        )
-        embedding = response.data[0].embedding
-        if use_cache and cache_key:
-            await cache_set_json(cache_key, embedding, EMBEDDING_CACHE_TTL_SECONDS)
-        return embedding
+        dense, sparse = (await aembed_texts([query]))[0]
     except Exception as e:
-        logger.error(f"Failed to generate embedding: {e}")
+        logger.exception("Failed to generate embedding: %s", e)
         raise
 
-
-def _normalize_embedding_language(value: Optional[str]) -> Optional[EmbeddingLanguage]:
-    normalized = str(value or "").strip().lower()
-    return normalized if normalized in {"zh", "en"} else None
-
-
-async def generate_routed_embedding(
-    text: str,
-    embedding_language: Optional[str] = None,
-) -> tuple[List[float], str]:
-    """Embed a query with the same language-specific model used at ingestion."""
-    route = get_embedding_route(text, language=_normalize_embedding_language(embedding_language))
-    query_hash = hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
-    cache_key = make_cache_key("embedding", route.model, query_hash)
-    cached = await cache_get_json(cache_key)
-    if isinstance(cached, list) and cached:
-        return cached, route.language
-    response = await asyncio.wait_for(
-        get_embedding_client_for_route(route).embeddings.create(
-            **build_embedding_request_kwargs(model=route.model, input_value=text, encoding_format="float")
-        ),
-        timeout=EMBEDDING_TIMEOUT_SECONDS,
-    )
-    embedding = response.data[0].embedding
-    await cache_set_json(cache_key, embedding, EMBEDDING_CACHE_TTL_SECONDS)
-    return embedding, route.language
-
-
-async def generate_retrieval_routes(
-    query: str,
-    embedding_language: Optional[str] = None,
-) -> List[tuple[List[float], str, str]]:
-    """Return the primary route plus an English bridge for Chinese free-text queries."""
-    embedding, resolved_language = await generate_routed_embedding(query, embedding_language)
-    routes = [(embedding, resolved_language, query)]
-    if embedding_language is not None or resolved_language != "zh":
-        return routes
-
-    translated_query = await translate_query_to_english(query)
-    if not translated_query:
-        return routes
-    english_embedding, _ = await generate_routed_embedding(translated_query, "en")
-    return routes + [(english_embedding, "en", translated_query)]
+    if use_cache and cache_key:
+        # JSON 对象的键只能是字符串，读回来时再转成 int 的稀疏向量下标。
+        await cache_set_json(
+            cache_key,
+            {"dense": dense, "sparse": {str(index): weight for index, weight in sparse.items()}},
+            EMBEDDING_CACHE_TTL_SECONDS,
+        )
+    return dense, sparse
 
 
 def merge_chunk_results(result_sets: List[List[ChunkResult]], limit: int) -> List[ChunkResult]:
@@ -176,7 +140,6 @@ class VectorSearchInput(BaseModel):
     query: str = Field(..., description="Search query")
     limit: int = Field(default=10, description="Maximum number of results")
     document_ids: Optional[List[str]] = Field(default=None, description="Optional document UUIDs to restrict search")
-    embedding_language: Optional[str] = Field(default=None, description="Corpus embedding language: zh or en")
 
 
 class HybridSearchInput(BaseModel):
@@ -184,7 +147,6 @@ class HybridSearchInput(BaseModel):
     limit: int = Field(default=10, description="Maximum number of results")
     text_weight: float = Field(default=0.3, description="Weight for text similarity (0-1)")
     document_ids: Optional[List[str]] = Field(default=None, description="Optional document UUIDs to restrict search")
-    embedding_language: Optional[str] = Field(default=None, description="Corpus embedding language: zh or en")
 
 
 class SectionSearchInput(BaseModel):
@@ -203,7 +165,6 @@ class ArtifactSearchInput(BaseModel):
     document_id: Optional[str] = None
     document_ids: Optional[List[str]] = None
     text_weight: float = Field(default=0.3, ge=0.0, le=1.0)
-    embedding_language: Optional[str] = None
 
 
 class DocumentInput(BaseModel):
@@ -619,22 +580,21 @@ async def web_search_tool(input_data: WebSearchInput) -> List[Dict[str, Any]]:
 
 async def vector_search_tool(input_data: VectorSearchInput) -> List[ChunkResult]:
     try:
-        routes = await generate_retrieval_routes(
-            input_data.query,
-            input_data.embedding_language,
-        )
+        # 这个工具只做纯语义检索：不给 sparse，Qdrant 就只比较稠密向量。
+        dense, _sparse = await embed_query(input_data.query)
     except Exception as e:
         logger.exception("Vector search embedding failed: %s", e)
         raise
     try:
-        result_sets = []
-        for embedding, embedding_language, _ in routes:
-            rows = await asyncio.wait_for(
-                vector_search(embedding=embedding, limit=input_data.limit, embedding_language=embedding_language, document_ids=input_data.document_ids),
-                timeout=LOCAL_SEARCH_TIMEOUT_SECONDS,
-            )
-            result_sets.append(_to_chunk_results(rows, "similarity"))
-        return merge_chunk_results(result_sets, input_data.limit)
+        rows = await asyncio.wait_for(
+            vector_search(
+                embedding=dense,
+                limit=input_data.limit,
+                document_ids=input_data.document_ids,
+            ),
+            timeout=LOCAL_SEARCH_TIMEOUT_SECONDS,
+        )
+        return _to_chunk_results(rows, "similarity")
     except Exception as e:
         logger.exception("Vector search failed: %s", e)
         raise
@@ -642,22 +602,23 @@ async def vector_search_tool(input_data: VectorSearchInput) -> List[ChunkResult]
 
 async def hybrid_search_tool(input_data: HybridSearchInput) -> List[ChunkResult]:
     try:
-        routes = await generate_retrieval_routes(
-            input_data.query,
-            input_data.embedding_language,
-        )
+        dense, sparse = await embed_query(input_data.query)
     except Exception as e:
         logger.exception("Hybrid search embedding failed: %s", e)
         raise
     try:
-        result_sets = []
-        for embedding, embedding_language, query_text in routes:
-            rows = await asyncio.wait_for(
-                hybrid_search(embedding=embedding, query_text=query_text, limit=input_data.limit, text_weight=input_data.text_weight, embedding_language=embedding_language, document_ids=input_data.document_ids),
-                timeout=LOCAL_SEARCH_TIMEOUT_SECONDS,
-            )
-            result_sets.append(_to_chunk_results(rows, "combined_score"))
-        return merge_chunk_results(result_sets, input_data.limit)
+        rows = await asyncio.wait_for(
+            hybrid_search(
+                embedding=dense,
+                query_text=input_data.query,
+                limit=input_data.limit,
+                text_weight=input_data.text_weight,
+                document_ids=input_data.document_ids,
+                sparse=sparse,
+            ),
+            timeout=LOCAL_SEARCH_TIMEOUT_SECONDS,
+        )
+        return _to_chunk_results(rows, "combined_score")
     except Exception as e:
         logger.exception("Hybrid search failed: %s", e)
         raise
@@ -697,23 +658,26 @@ async def artifact_search_tool(input_data: ArtifactSearchInput) -> List[ChunkRes
         normalized_types = ["table", "figure", "algorithm"]
 
     try:
-        routes = await generate_retrieval_routes(
-            input_data.query,
-            input_data.embedding_language,
-        )
+        dense, sparse = await embed_query(input_data.query)
     except Exception as e:
         logger.exception("Artifact search embedding failed: %s", e)
         raise
 
     try:
-        result_sets = []
-        for embedding, embedding_language, query_text in routes:
-            rows = await asyncio.wait_for(
-                artifact_search(embedding=embedding, query_text=query_text, limit=input_data.limit, artifact_types=normalized_types, document_id=input_data.document_id, document_ids=input_data.document_ids, text_weight=input_data.text_weight, embedding_language=embedding_language),
-                timeout=LOCAL_SEARCH_TIMEOUT_SECONDS,
-            )
-            result_sets.append(_to_chunk_results(rows, "combined_score"))
-        return merge_chunk_results(result_sets, input_data.limit)
+        rows = await asyncio.wait_for(
+            artifact_search(
+                embedding=dense,
+                query_text=input_data.query,
+                limit=input_data.limit,
+                artifact_types=normalized_types,
+                document_id=input_data.document_id,
+                document_ids=input_data.document_ids,
+                text_weight=input_data.text_weight,
+                sparse=sparse,
+            ),
+            timeout=LOCAL_SEARCH_TIMEOUT_SECONDS,
+        )
+        return _to_chunk_results(rows, "combined_score")
     except Exception as e:
         logger.exception("Artifact search failed: %s", e)
         raise

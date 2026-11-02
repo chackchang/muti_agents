@@ -1,15 +1,22 @@
+import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional, Sequence
+from typing import Any, Dict, Literal, Optional, Sequence, get_args
 
-from .db_utils import db_pool
+from agent.cache.db_utils import db_pool
 
 IngestionTaskStatus = Literal[
     "queued", "processing", "paused", "done", "failed", "paused_quota", "deleted"
 ]
+_VALID_TASK_STATUSES = frozenset(get_args(IngestionTaskStatus))
+# 状态跃迁的前置条件：可以是单个状态，也可以是一组（例如「处理中被重投递」）。
+ExpectedTaskStatus = IngestionTaskStatus | Sequence[IngestionTaskStatus]
+# 显式声明「不设前置条件、覆盖任何状态」。只有确实要强制改写时才传，
+# 不提供隐式默认值——忘记传 expected_status 会直接报错，而不是静默放行。
+ALL_TASK_STATUSES: tuple[str, ...] = get_args(IngestionTaskStatus)
 
 _TASK_COLUMNS = """
-    task_id, document_id::text, file_path, filename, fast, status, queue_order,
+    task_id, document_id::text, file_path, filename, fast, payload, status, queue_order,
     progress_percent, progress_stage, error_message, retry_count, created_at,
     updated_at, started_at, finished_at
 """
@@ -17,12 +24,19 @@ _TASK_COLUMNS = """
 
 def _serialize_ingestion_task(row: Any) -> Dict[str, Any]:
     get = row.get if hasattr(row, "get") else row.__getitem__
+    raw_payload = get("payload")
+    if isinstance(raw_payload, str):
+        try:
+            raw_payload = json.loads(raw_payload)
+        except json.JSONDecodeError:
+            raw_payload = {}
     return {
         "task_id": get("task_id"),
         "document_id": get("document_id"),
         "file_path": get("file_path"),
         "filename": get("filename") or Path(str(get("file_path") or "")).name,
         "fast": bool(get("fast") or False),
+        "payload": dict(raw_payload) if isinstance(raw_payload, dict) else {},
         "status": get("status"),
         "queue_order": int(get("queue_order") or 0),
         "progress_percent": int(get("progress_percent") or 0),
@@ -46,22 +60,24 @@ async def create_ingestion_task(
     retry_count: int = 0,
     started_at: Optional[datetime] = None,
     finished_at: Optional[datetime] = None,
+    payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             f"""
             INSERT INTO ingestion_tasks (
-                task_id, document_id, file_path, filename, fast, status, queue_order,
+                task_id, document_id, file_path, filename, fast, payload, status, queue_order,
                 progress_percent, progress_stage, error_message, retry_count, started_at, finished_at
             )
             VALUES (
-                $1, $2::uuid, $3, $4, $5, $6,
+                $1, $2::uuid, $3, $4, $5, $6::jsonb, $7,
                 (SELECT COALESCE(MAX(queue_order), 0) + 1 FROM ingestion_tasks),
-                0, '等待入库', $7, $8, $9, $10
+                0, '等待入库', $8, $9, $10, $11
             )
             RETURNING {_TASK_COLUMNS}
             """,
-            task_id, document_id, file_path, Path(file_path).name, fast, status,
+            task_id, document_id, file_path, Path(file_path).name, fast,
+            json.dumps(payload or {}, ensure_ascii=False), status,
             error_message, retry_count, started_at, finished_at,
         )
         return _serialize_ingestion_task(row)
@@ -83,6 +99,28 @@ async def list_ingestion_tasks(limit: int = 100) -> Sequence[Dict[str, Any]]:
         return [_serialize_ingestion_task(row) for row in rows]
 
 
+async def list_unpublished_queued_tasks(limit: int = 100) -> Sequence[Dict[str, Any]]:
+    """queued 且还没有确认发布过的任务——worker 启动时只需要补发这些。"""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT {_TASK_COLUMNS} FROM ingestion_tasks
+                WHERE status='queued' AND publish_state=false
+                ORDER BY queue_order, created_at LIMIT $1""",
+            max(1, min(limit, 500)),
+        )
+        return [_serialize_ingestion_task(row) for row in rows]
+
+
+async def mark_ingestion_task_published(task_id: str) -> None:
+    """发布成功后置位；发布失败或中途崩溃时保持 false，等下次补发。"""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE ingestion_tasks SET publish_state=true, updated_at=CURRENT_TIMESTAMP "
+            "WHERE task_id=$1",
+            task_id,
+        )
+
+
 async def get_next_queued_ingestion_task() -> Optional[Dict[str, Any]]:
     """Return the next runnable task according to the user-managed queue order."""
     async with db_pool.acquire() as conn:
@@ -91,6 +129,27 @@ async def get_next_queued_ingestion_task() -> Optional[Dict[str, Any]]:
                 ORDER BY queue_order, created_at LIMIT 1"""
         )
         return _serialize_ingestion_task(row) if row else None
+
+
+def _normalize_expected_status(expected_status: ExpectedTaskStatus) -> list[str]:
+    """把 expected_status 归一化成非空的 text[]。
+
+    不给 ``None`` 留通道：没有前置条件就等于没有保护。需要强制改写时传
+    ``ALL_TASK_STATUSES``，让"我不校验"这件事在调用点可见。
+    """
+    if expected_status is None:
+        raise TypeError(
+            "expected_status is required: pass the statuses this update expects, "
+            "or ALL_TASK_STATUSES to overwrite regardless of the current status"
+        )
+    values = [expected_status] if isinstance(expected_status, str) else list(expected_status)
+    if not values:
+        raise ValueError("expected_status must list at least one status")
+    invalid = [value for value in values if value not in _VALID_TASK_STATUSES]
+    if invalid:
+        raise ValueError(f"invalid expected_status: {invalid}")
+    # 去重但保序，便于调用方按「正常路径 → 兜底路径」书写
+    return list(dict.fromkeys(values))
 
 
 async def update_ingestion_task_status(
@@ -103,7 +162,23 @@ async def update_ingestion_task_status(
     finished_at: Optional[datetime] = None,
     progress_percent: Optional[int] = None,
     progress_stage: Optional[str] = None,
+    *,
+    expected_status: ExpectedTaskStatus,
+    publish_state: Optional[bool] = None,
 ) -> Optional[Dict[str, Any]]:
+    """Update a task status as a guarded state transition.
+
+    ``expected_status`` 把这次写入变成一次「比较并交换」：只有当前状态在给定集合内才会生效，
+    由数据库在同一个 UPDATE 里原子校验，避免 worker 与应用侧并发写入时互相覆盖
+    （典型场景：用户暂停/删除任务的同时，worker 正好在写进度或完成状态）。
+
+    参数是**必填**的，没有隐式默认值：每次写入都必须说明"我认为它现在是什么状态"。
+    确实要无条件覆盖时传 ``ALL_TASK_STATUSES``。
+
+    返回 ``None`` 表示这次没有写成——任务不存在，或当前状态已不是预期。
+    需要区分两者时，调用方自行 ``get_ingestion_task`` 复查。
+    """
+    expected = _normalize_expected_status(expected_status)
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             f"""
@@ -111,11 +186,14 @@ async def update_ingestion_task_status(
                 error_message=$4, retry_count=COALESCE($5, retry_count),
                 started_at=COALESCE($6, started_at), finished_at=COALESCE($7, finished_at),
                 progress_percent=COALESCE($8, progress_percent),
-                progress_stage=COALESCE($9, progress_stage), updated_at=CURRENT_TIMESTAMP
-            WHERE task_id=$1 RETURNING {_TASK_COLUMNS}
+                progress_stage=COALESCE($9, progress_stage),
+                publish_state=COALESCE($11::boolean, publish_state), updated_at=CURRENT_TIMESTAMP
+            WHERE task_id=$1 AND status = ANY($10::text[])
+            RETURNING {_TASK_COLUMNS}
             """,
             task_id, status, document_id, error_message, retry_count, started_at, finished_at,
             max(0, min(100, progress_percent)) if progress_percent is not None else None, progress_stage,
+            expected, publish_state,
         )
         return _serialize_ingestion_task(row) if row else None
 
@@ -135,7 +213,8 @@ async def resume_ingestion_task(task_id: str) -> Optional[Dict[str, Any]]:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             f"""UPDATE ingestion_tasks SET status='queued', error_message=NULL, retry_count=0,
-                    progress_stage='等待入库', finished_at=NULL, updated_at=CURRENT_TIMESTAMP
+                    progress_stage='等待入库', finished_at=NULL, publish_state=false,
+                    updated_at=CURRENT_TIMESTAMP
                 WHERE task_id=$1 AND status IN ('paused', 'paused_quota') RETURNING {_TASK_COLUMNS}""",
             task_id,
         )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 import argparse, asyncio
 from pathlib import Path
-from agent.db_utils import close_database, initialize_database
+from agent.cache.db_utils import close_database, initialize_database
 from common.encoding_utils import write_json_utf8, write_text_utf8
 from evals.corpus_qa_eval_runtime import build_cases, markdown, run_cases
 

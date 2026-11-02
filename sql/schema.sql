@@ -96,6 +96,10 @@ CREATE TABLE IF NOT EXISTS documents (
     fingerprint    text NOT NULL DEFAULT '',
     version        integer NOT NULL DEFAULT 1,
     is_current     boolean NOT NULL DEFAULT true,
+    -- 删除状态机：active（可检索）→ deleting（已请求删除，Qdrant 待清理）
+    -- → deleted（Qdrant 已清理，行待物理删除）。检索/列表/下载只认 active。
+    status         text NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'deleting', 'deleted')),
     title          text NOT NULL DEFAULT '',
     source         text NOT NULL DEFAULT '',
     content        text NOT NULL DEFAULT '',
@@ -112,6 +116,21 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS logical_id  text NOT NULL DEFAULT
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS fingerprint text NOT NULL DEFAULT '';
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS version     integer NOT NULL DEFAULT 1;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS is_current  boolean NOT NULL DEFAULT true;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS status      text NOT NULL DEFAULT 'active';
+
+-- 约束单独加：存量库的 status 列刚补上，需要与新建库保持一致的取值校验。
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'documents_status_check'
+    ) THEN
+        ALTER TABLE documents
+            ADD CONSTRAINT documents_status_check
+            CHECK (status IN ('active', 'deleting', 'deleted'));
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_documents_status ON documents (status);
 
 -- 存量行回填：逻辑ID取自 source，指纹取自 content（content 指纹与 Python 侧
 -- 配置指纹不同，首次重跑会走 update 替换，但不会重复入库）。
@@ -261,6 +280,55 @@ CREATE INDEX IF NOT EXISTS idx_paper_graph_edges_source
     ON paper_graph_edges (source_document_id);
 CREATE INDEX IF NOT EXISTS idx_paper_graph_edges_target
     ON paper_graph_edges (target_document_id);
+
+-- ---------------------------------------------------------------------------
+-- 异步入库任务（RabbitMQ worker 的持久化状态）
+-- task_id 由应用生成（uuid4().hex），所以用 text 而不是 uuid；
+-- document_id 在任务完成前为 NULL，完成后回填 documents.id。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ingestion_tasks (
+    task_id          text PRIMARY KEY,
+    document_id      uuid,
+    file_path        text NOT NULL,
+    filename         text,
+    fast             boolean NOT NULL DEFAULT false,
+    -- 用户提供的身份信息（至少 doi 或 title 之一），逻辑ID据此计算，
+    -- 同时供 worker 重试/重启恢复时还原，不能只放在 RabbitMQ 消息里。
+    payload          jsonb NOT NULL DEFAULT '{}'::jsonb,
+    -- 队列消息发布标记：false = 这次 queued 可能还没有对应的 RabbitMQ 消息，
+    -- 需要（重新）发布；true = 已经成功发布过。worker 启动只补发 false 的任务，
+    -- 避免每次重启都把整个队列重复投递一遍。
+    publish_state    boolean NOT NULL DEFAULT false,
+    status           text NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'processing', 'paused', 'done', 'failed', 'paused_quota', 'deleted')),
+    queue_order      integer NOT NULL DEFAULT 0,
+    progress_percent integer NOT NULL DEFAULT 0
+        CHECK (progress_percent BETWEEN 0 AND 100),
+    progress_stage   text NOT NULL DEFAULT '等待入库',
+    error_message    text,
+    retry_count      integer NOT NULL DEFAULT 0,
+    created_at       timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at       timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    started_at       timestamptz,
+    finished_at      timestamptz
+);
+
+-- 迁移：为已存在的任务表补上身份 payload。
+ALTER TABLE ingestion_tasks
+    ADD COLUMN IF NOT EXISTS payload jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+-- 迁移：补发标记。存量行默认 false，新 worker 启动时会补发一次（与旧行为一致），
+-- 之后新任务只在真正需要投递时才复位，重启不再重复发布。
+ALTER TABLE ingestion_tasks
+    ADD COLUMN IF NOT EXISTS publish_state boolean NOT NULL DEFAULT false;
+
+CREATE INDEX IF NOT EXISTS idx_ingestion_tasks_unpublished
+    ON ingestion_tasks (status, publish_state, queue_order);
+
+CREATE INDEX IF NOT EXISTS idx_ingestion_tasks_status_queue
+    ON ingestion_tasks (status, queue_order, created_at);
+CREATE INDEX IF NOT EXISTS idx_ingestion_tasks_queue_order
+    ON ingestion_tasks (queue_order, created_at);
 
 -- ---------------------------------------------------------------------------
 -- SQL 函数

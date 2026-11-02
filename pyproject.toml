@@ -5,9 +5,17 @@ description = "A simple agent to fetch and extract text from dynamic websites"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "aio-pika>=9.6",
     "asyncpg>=0.32.0",
     "docling>=2.142.0",
+    "fastapi>=0.162",
+    "flagembedding>=1.3.0",
+    "httpx>=0.28",
+    "langchain>=1.0",
+    "langchain-core>=1.7",
+    "langchain-openai>=1.7",
     "langchain-text-splitters>=1.1.3",
+    "langgraph>=1.2",
     "magic-pdf[full]>=0.6.1",
     "openai>=3.37.0",
     "playwright>=1.49",
@@ -15,13 +23,13 @@ dependencies = [
     "pypdfium2>=5.14.0",
     "python-dotenv>=1.2.4",
     "qdrant-client>=1.12.0",
+    "redis>=8.1",
     "trafilatura>=2.3.1",
+    "uvicorn>=0.54",
 ]
 
-[project.optional-dependencies]
-embedding = [
-    "flagembedding>=1.3.0",
-]
+# 本地 GE-M3 是默认嵌入后端，没有它 /search 与摄取都不可用，因此放进主依赖，
+# 避免 `uv sync` / `uv run` 把它当成未启用的 optional extra 删掉。
 
 [dependency-groups]
 dev = [

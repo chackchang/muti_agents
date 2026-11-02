@@ -7,13 +7,13 @@ against it, so tool selection cannot silently cross source boundaries.
 
 from typing import Any, Dict, Iterable, List, Tuple
 
-from .intent_planner import IntentPlan, RetrievalStep
+from agent.model.intent_models import IntentPlan, RetrievalStep
 from .retrieval_harness_schema import (
     RetrievalContract,
     RetrievalContractEvaluation,
     RetrievalPlanEnforcement,
 )
-from .tool_specs import get_tool_source_type
+from agent.tools.tool_specs import get_tool_source_type
 
 
 def _unique(values: Iterable[str]) -> List[str]:

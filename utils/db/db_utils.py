@@ -850,7 +850,7 @@ async def get_document(document_id: str) -> Optional[Dict[str, Any]]:
                 created_at,
                 updated_at
             FROM documents
-            WHERE id = $1::uuid
+            WHERE id = $1::uuid AND status = 'active'
             """,
             document_id
         )
@@ -872,7 +872,8 @@ async def get_document(document_id: str) -> Optional[Dict[str, Any]]:
 async def get_document_pdf(document_id: str) -> Optional[Dict[str, Any]]:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT pdf_blob, pdf_media_type FROM documents WHERE id = $1::uuid", document_id
+            "SELECT pdf_blob, pdf_media_type FROM documents WHERE id = $1::uuid AND status = 'active'",
+            document_id,
         )
         if not row or row["pdf_blob"] is None:
             return None
@@ -885,7 +886,12 @@ async def get_document_pdf_bytes(document_id: str) -> Optional[bytes]:
 
 
 async def delete_document(document_id: str) -> bool:
-    """Delete one paper, its dependent rows, and its Qdrant chunk vectors."""
+    """[legacy] 直接物理删除文档并尽力清理向量。
+
+    正式删除流程请用 ``agent.cache.document_deletion.request_document_deletion``：
+    它按 active -> deleting -> deleted -> 物理删除 推进，避免 Qdrant 与
+    PostgreSQL 状态不一致。这个函数只留给离线脚本。
+    """
     async with db_pool.acquire() as conn:
         result = await conn.execute("DELETE FROM documents WHERE id = $1::uuid", document_id)
     if result == "DELETE 0":
@@ -1037,8 +1043,9 @@ async def list_documents(
         """
         
         params = []
-        conditions = []
-        
+        # 删除中的文档（deleting/deleted）对外不可见：列表只展示 active。
+        conditions = ["d.status = 'active'"]
+
         if metadata_filter:
             conditions.append(f"d.metadata @> ${len(params) + 1}::jsonb")
             params.append(json.dumps(metadata_filter))
@@ -1091,6 +1098,7 @@ async def list_document_sections(document_ids: List[str]) -> List[Dict[str, Any]
             FROM chunks c
             JOIN documents d ON d.id = c.document_id
             WHERE c.document_id = ANY($1::uuid[])
+              AND d.status = 'active'
               AND COALESCE(c.metadata->>'section_path_text', c.metadata->>'section_title', '') <> ''
             GROUP BY c.document_id, d.title, COALESCE(c.metadata->>'section_path_text', c.metadata->>'section_title', ''),
                      COALESCE(c.metadata->>'section_title', '')
@@ -1113,6 +1121,42 @@ async def list_document_sections(document_ids: List[str]) -> List[Dict[str, Any]
     ]
 
 # 向量搜索函数（Qdrant）
+_ACTIVE_FILTER_OVERFETCH = 3
+_ACTIVE_FILTER_MAX_FETCH = 200
+
+
+def _overfetch_limit(limit: int, cap: int = _ACTIVE_FILTER_MAX_FETCH) -> int:
+    """多取一些候选，抵消删除中文档被过滤后的数量损失。"""
+    safe_limit = max(1, int(limit or 10))
+    return max(safe_limit, min(safe_limit * _ACTIVE_FILTER_OVERFETCH, cap))
+
+
+async def _filter_active_document_hits(
+    hits: List[Dict[str, Any]],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """只保留 PostgreSQL 中 status='active' 的文档命中。
+
+    Qdrant 删向量和 PostgreSQL 改状态不是原子的：文档可能已经进入
+    deleting/deleted，但向量尚未删完。检索结果必须回查 PG 状态，
+    否则会返回正在删除的论文。
+    """
+    document_ids = sorted(
+        {str(hit.get("document_id") or "") for hit in hits if hit.get("document_id")}
+    )
+    if not document_ids:
+        return hits[:limit]
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id::text FROM documents WHERE id = ANY($1::uuid[]) AND status = 'active'",
+            document_ids,
+        )
+    active_ids = {str(row["id"]) for row in rows}
+    return [
+        hit for hit in hits if str(hit.get("document_id") or "") in active_ids
+    ][:limit]
+
+
 async def _resolve_query_sparse(
     query_text: str,
     sparse: Optional[Dict[int, float]],
@@ -1144,14 +1188,15 @@ async def vector_search(
     Returns:
         按相似度排序的匹配分块列表（最相关的在前）
     """
+    safe_limit = max(1, int(limit or 10))
     results = await asyncio.to_thread(
         qdrant_store.search,
         embedding,
         sparse,
-        limit=limit,
+        limit=_overfetch_limit(safe_limit),
         document_ids=document_ids,
     )
-    return [
+    hits = [
         {
             "chunk_id": item["chunk_id"],
             "document_id": item["document_id"],
@@ -1163,6 +1208,7 @@ async def vector_search(
         }
         for item in results
     ]
+    return await _filter_active_document_hits(hits, safe_limit)
 
 
 async def hybrid_search(
@@ -1180,15 +1226,16 @@ async def hybrid_search(
     GE-M3 的稀疏通道承担。未传 ``sparse`` 时用 ``query_text`` 现场编码。
     """
     del text_weight
+    safe_limit = max(1, int(limit or 10))
     resolved_sparse = await _resolve_query_sparse(query_text, sparse)
     results = await asyncio.to_thread(
         qdrant_store.search,
         embedding,
         resolved_sparse,
-        limit=limit,
+        limit=_overfetch_limit(safe_limit),
         document_ids=document_ids,
     )
-    return [
+    hits = [
         {
             "chunk_id": item["chunk_id"],
             "document_id": item["document_id"],
@@ -1200,6 +1247,7 @@ async def hybrid_search(
         }
         for item in results
     ]
+    return await _filter_active_document_hits(hits, safe_limit)
 
 
 async def section_search(
@@ -1225,6 +1273,9 @@ async def section_search(
         conditions: List[str] = []
         params: List[Any] = []
         idx = 1
+
+        # 删除中的文档不参与检索。
+        conditions.append("d.status = 'active'")
 
         # Prefer section-aware chunks for this tool.
         conditions.append(
@@ -1372,17 +1423,18 @@ async def artifact_search(
         for value in (artifact_types or [])
         if str(value or "").strip().lower() in {"table", "figure", "algorithm"}
     ]
+    safe_limit = max(1, min(int(limit or 10), 50))
     results = await asyncio.to_thread(
         qdrant_store.search,
         embedding,
         resolved_sparse,
-        limit=max(1, min(int(limit or 10), 50)),
+        limit=_overfetch_limit(safe_limit, cap=150),
         document_id=document_id,
         document_ids=document_ids,
         artifact_types=normalized_types or None,
         content_type="artifact",
     )
-    return [
+    hits = [
         {
             "chunk_id": item["chunk_id"],
             "document_id": item["document_id"],
@@ -1394,6 +1446,7 @@ async def artifact_search(
         }
         for item in results
     ]
+    return await _filter_active_document_hits(hits, safe_limit)
 
 
 async def get_artifact(artifact_id: str) -> Optional[Dict[str, Any]]:

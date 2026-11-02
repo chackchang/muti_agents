@@ -4,10 +4,10 @@ import os
 from typing import Any, Dict, List
 
 from .app_config import get_rabbitmq_url
-from .cache_utils import get_redis_runtime_status
-from .openalex_router import _is_openalex_enabled
-from .tools import get_general_web_search_provider, is_general_web_search_enabled
-from .external_retrieval_resilience import (
+from agent.cache.cache_utils import get_redis_runtime_status
+from agent.providers.openalex_router import _is_openalex_enabled
+from agent.retrieval.tools import get_general_web_search_provider, is_general_web_search_enabled
+from agent.retrieval.external_retrieval_resilience import (
     external_retrieval_circuit_cooldown_seconds,
     external_retrieval_circuit_threshold,
     external_retrieval_retry_count,
@@ -125,7 +125,7 @@ def build_runtime_diagnostics() -> Dict[str, Any]:
         warnings.append(
             {
                 "code": "missing_openai_api_key",
-                "message": "OPENAI_API_KEY is empty; LLM and embedding requests will fail.",
+                "message": "OPENAI_API_KEY is empty; LLM requests will fail.",
             }
         )
     if not openai_base_url:
