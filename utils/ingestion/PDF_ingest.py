@@ -5,6 +5,8 @@ from datetime import datetime
 import hashlib
 import json
 import logging
+from logconfig import setup_logging
+
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -948,11 +950,7 @@ async def document_ingest_api(
     payload: Optional[Dict[str, Any]] = None,
 ):
     '''学术文档pdf入库接口'''
-    log_level = logging.DEBUG if config.verbose else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+    setup_logging(verbose=config.verbose)
 
     if config.include_images or config.include_tables:
         logger.warning(
@@ -1041,12 +1039,7 @@ async def main():
         if not payload:
             raise ValueError("--payload-json is empty")
 
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-
+    setup_logging(verbose=args.verbose)
     no_images = bool(args.no_images or args.fast)
     no_tables = bool(args.no_tables or args.fast)
 

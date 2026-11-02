@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+from logconfig import setup_logging
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional
@@ -213,13 +215,7 @@ RABBITMQ_URL = get_rabbitmq_url()
 AGENT_RUNTIME_BACKEND = "langchain"
 
 
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper()),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-
-if APP_ENV == "development":
-    logger.setLevel(logging.DEBUG)
+setup_logging(verbose=APP_ENV == "development")
 
 REACT_RUNTIME_INSTRUCTION = (
     "Deep analysis is enabled for this turn. Internally run a lightweight ReAct flow: "
@@ -418,6 +414,33 @@ async def _next_stream_event_with_timeout(
     return await asyncio.wait_for(stream_iter.__anext__(), timeout=timeout_seconds)
 
 
+async def _warmup_retrieval_stack(timeout_seconds: float = 300.0) -> None:
+    """启动时预热检索链路：加载本地 GE-M3，并跑一次最小检索。
+
+    首次检索要先加载嵌入模型（CPU 上约 1–2 分钟），放在启动阶段做，
+    第一个用户请求就不用承担这份延迟。失败只告警：检索不可用不等于
+    整个服务不可用，具体请求仍会各自报错。
+    """
+    started = time.perf_counter()
+    try:
+        await asyncio.wait_for(
+            vector_search_tool(VectorSearchInput(query="warmup", limit=1)),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Retrieval warmup timed out after %.0fs; the first query may still be slow",
+            timeout_seconds,
+        )
+        return
+    except Exception as exc:
+        logger.warning(
+            "Retrieval warmup failed after %.1fs: %s", time.perf_counter() - started, exc
+        )
+        return
+    logger.info("Retrieval warmup finished in %.1fs", time.perf_counter() - started)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting up system...")
@@ -429,6 +452,9 @@ async def lifespan(app: FastAPI):
         db_ok = await test_connection()
         if not db_ok:
             logger.error("Database connection failed")
+        # 检索链路预热放在「启动完成」之前：等 API 对外可用时模型已经加载好。
+        warmup_timeout = float(os.getenv("RETRIEVAL_WARMUP_TIMEOUT_SECONDS", "300"))
+        await _warmup_retrieval_stack(timeout_seconds=warmup_timeout)
         logger.info("System startup complete")
     except Exception as e:
         logger.error(f"Startup failed: {e}")

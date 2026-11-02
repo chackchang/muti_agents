@@ -1,6 +1,8 @@
 import asyncio
 import json
 import logging
+from logconfig import setup_logging
+
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -440,10 +442,7 @@ async def consume_ingestion_tasks() -> None:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+    setup_logging(verbose=False)
     asyncio.run(consume_ingestion_tasks())
 
 
